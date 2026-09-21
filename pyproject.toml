@@ -1,11 +1,10 @@
 [project]
 name = "wmts-tile-tool"
 version = "0.1.0"
-description = "WMTS 瓦片下载与拼接工具（Python + Rust 高速合并引擎）"
+description = "WMTS 瓦片下载与拼接工具（Rust 高速合并引擎）"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "pillow>=12.1.1",
     "requests>=2.32.5",
     "tqdm>=4.66.0",
     "httpx>=0.27.0",

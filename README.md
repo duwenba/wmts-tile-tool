@@ -5,14 +5,13 @@
 ![uv](https://img.shields.io/badge/uv-%E5%8C%85%E7%AE%A1%E7%90%86%E5%99%A8-8E7DFF?logo=astral&logoColor=white)
 ![GitHub Stars](https://img.shields.io/github/stars/duwenba/wmts-tile-tool?style=social)
 
-高性能的 **WMTS 瓦片批量下载与拼接** 工具：HTTP/2 异步高并发下载、断点续传与失败重试；Python 与 **Rust 双拼接引擎**，Rust 引擎可在内存恒定（实测 <22 MB）下快速合并超大图（数十亿像素）；内置 wxPython 图形界面。
+高性能的 **WMTS 瓦片批量下载与拼接** 工具：HTTP/2 异步高并发下载、断点续传与失败重试；默认 **Rust 拼接引擎**（内存恒定、实测 <22 MB）快速合并超大图（数十亿像素）并输出分块 BigTIFF（.tif）；内置 wxPython 图形界面。
 
 ## ✨ 功能特性
 
 - ⚡ **异步高并发下载**：HTTP/2、有界队列 + 固定 worker 池、流式写盘，内存恒定在 O(并发数)
 - 🔁 **断点续传与失败重试**：智能指数退避（尊重服务端限流），`Ctrl+C` 安全中断
-- 🧩 **双拼接引擎**：Python（batch / streaming / lowmem 多模式）+ Rust（超大图内存恒定）
-- 🚀 **Rust 引擎**：分块 BigTIFF / 流式 PNG、8 核并行压缩、实测 32.9 亿像素 8 秒完成、峰值内存 21.6 MB
+- 🧩 **Rust 拼接引擎**：分块 BigTIFF / 流式 PNG、内存恒定、8 核并行压缩，实测 32.9 亿像素 8 秒完成、峰值内存 21.6 MB
 - 🖥️ **wxPython 图形界面**：任务流水线可视化、单个瓦片预览、范围总览网格、实时进度
 - 🗃️ **瓦片缓存管理**：分级目录结构、统计 / 清理 / 迁移 / 校验（CLI 与 GUI）
 
@@ -39,8 +38,7 @@ uv run python gui_main.py
 | `config.py` | **统一配置文件**（下载与拼接参数都在此修改） |
 | `download_tiles_async.py` | 异步下载脚本（HTTP/2，推荐） |
 | `download_tiles.py` | 同步下载脚本 |
-| `merge_tiles.py` | Python 拼接脚本（batch / streaming / lowmem 多模式） |
-| `merge_rs_cli.py` | **Rust 合并引擎便捷入口**（推荐超大图） |
+| `merge_rs_cli.py` | **Rust 合并引擎便捷入口（拼接入口）** |
 | `merge_rs/` | Rust 合并引擎源码（cargo 项目） |
 | `gui_main.py` | **wxPython 图形界面**（推荐使用） |
 | `tile_path.py` | 缓存路径统一管理（新旧目录结构兼容） |
@@ -61,7 +59,7 @@ TILE_ROW_END = 10740      # 行结束
 
 # 其他设置
 MAX_WORKERS = 16          # 并发下载数
-OUTPUT_FILE = "merged_map.png"   # 输出文件名
+OUTPUT_FILE = "merged_map.tif"   # 输出文件名（默认 Rust 引擎分块 BigTIFF）
 ```
 
 > 如需更换数据源，请更新 `BASE_URL`、`LAYER` 与 `HEADERS`（部分服务需要 Cookie 鉴权）。
@@ -78,41 +76,10 @@ uv run python download_tiles.py
 
 下载支持断点续传：中断后直接重新运行即可，自动跳过已下载瓦片、重试失败瓦片。详见「断点续传」。
 
-## 🧩 拼接大图（Python 版）
+## ⚡ Rust 高速合并引擎
 
-```bash
-# 默认模式（streaming + fast，低内存）
-uv run python merge_tiles.py
-
-# 批量模式（平衡速度与内存，最快）
-uv run python merge_tiles.py batch fast
-
-# 批量 + 优化压缩（文件更小，较慢）
-uv run python merge_tiles.py batch optimize
-
-# 超低内存模式（超大图 / 低内存机器）
-uv run python merge_tiles.py lowmem fast
-
-# 查看全部参数
-uv run python merge_tiles.py --help
-```
-
-**模式对比：**
-
-| 模式 | 保存模式 | 内存占用 | 速度 | 最佳场景 |
-|------|----------|----------|------|----------|
-| batch | fast | 中 | 最快 | 快速开发/测试 |
-| batch | optimize | 中 | 快 | 最终输出/压缩 |
-| streaming | fast | 低 | 中快 | 内存受限（默认） |
-| streaming | optimize | 低 | 中 | 需要压缩+低内存 |
-| lowmem | fast | 最低 | 中 | 超大图/低内存 |
-
-拼接结果默认保存为 `config.py` 中 `OUTPUT_FILE` 指定的文件（`merged_map.png`）。
-
-## ⚡ Rust 高速合并引擎（推荐超大图）
-
-> 当拼接范围很大（合并后未压缩超过 2~3 GB）时，**强烈建议使用 Rust 引擎**：
-> Python 版在 7.5 GB 内存的机器上 batch 模式会直接 OOM，streaming 模式单线程压缩需数小时。
+> 🚀 **Rust 是唯一的拼接引擎**，CLI 与 GUI 均通过它拼接，默认输出分块 BigTIFF（.tif）。
+> 内存峰值恒定（实测 <22 MB），超大图（数十亿像素）也不会 OOM。
 
 先编译一次：
 
@@ -123,14 +90,14 @@ cd merge_rs && cargo build --release
 使用（自动读取 `config.py` 的下载范围）：
 
 ```bash
-# 默认：按 config.py 输出文件名自动判断格式（merged_map.png → PNG）
+# 默认：输出分块 BigTIFF（.tif，无损、内存恒定、8 核并行）
 uv run python merge_rs_cli.py
 
-# 推荐超大图：输出分块 BigTIFF（无损、内存恒定、8 核并行）
-uv run python merge_rs_cli.py --format tif --out merged_map.tif
+# 指定输出文件 / 压缩级别 / 线程数
+uv run python merge_rs_cli.py --out merged_map.tif --threads 8 --level 6
 
-# 指定压缩级别 / 线程数
-uv run python merge_rs_cli.py --format tif --threads 8 --level 6
+# 单张 PNG（中等成图 / 普通看图软件）
+uv run python merge_rs_cli.py --format png --out merged_map.png
 ```
 
 也可直接用二进制，自定义瓦片目录和范围：
@@ -149,7 +116,7 @@ merge_rs/target/release/merge_rs --tiles-dir tiles \
    - `tif`（默认）：分块 BigTIFF，无损 deflate，可被 QGIS / GIMP / ImageMagick / GDAL 直接打开；
      超大图建议用此格式（普通看图软件打不开超大 PNG）。
    - `png`：单张 PNG 流式写出（Sub 滤波 + zlib），内存 ≈ 一条瓦片行，适合中等成图。
-4. **行为与 Python 版一致**：源瓦片展开为 RGB 并丢弃 alpha（等价 `convert('RGB')`），缺失瓦片填黑。
+4. **行为说明**：源瓦片展开为 RGB 并丢弃 alpha（等价 `convert('RGB')`），缺失瓦片填黑。
 
 ## 🖥️ 图形界面（wxPython）
 
@@ -226,7 +193,7 @@ cat download_failed.txt                  # 查看失败列表（如有）
 本项目在下载与拼接环节做了针对性优化，核心手段：
 
 - **下载**：JSONL 追加写进度（避免进度常驻内存）、有界队列 + 固定 worker 池、`client.stream` 流式写盘、指数退避重试（429/503 退避更久）、取消响应及时。
-- **拼接（Python）**：按行分批处理避免全量加载、`fast` 模式跳过 PNG 优化（提速 5-10 倍）、`gc.collect()` 及时释放、lowmem 模式使用内存映射。
+- **拼接（Rust）**：分块 BigTIFF 内存恒定、rayon 8 核并行压缩、写入串行保证偏移连续（详见 [docs/performance.md](docs/performance.md)）。
 
 > 📄 完整设计思路、演进过程与实测数据见 [docs/performance.md](docs/performance.md)。
 
@@ -240,7 +207,8 @@ https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ 选择对应发行版/�
 
 ### 没有 Rust 工具链还能用吗？
 
-可以。Python 版 `merge_tiles.py` 无需 Rust；只有超大图想用 Rust 引擎才需要 `cargo build --release`（只需一次）。
+拼接依赖 Rust 引擎，首次使用前需先 `cd merge_rs && cargo build --release`（只需一次）。
+若无法安装 Rust 工具链，则无法完成拼接（下载瓦片与 GUI 仍可用）。
 
 ### 超大图用什么格式、什么软件打开？
 

@@ -1,6 +1,8 @@
 """
 WMTS 瓦片下载与拼接 - 统一配置文件
-在此文件中配置参数，download_tiles.py 和 merge_tiles.py 将自动读取
+在此文件中配置参数，download_tiles*.py 与 merge_rs_cli.py（Rust 引擎）将自动读取
+
+拼接引擎：Rust（merge_rs_cli.py / GUI），默认输出分块 BigTIFF（.tif）。
 """
 
 # from string import Template
@@ -28,7 +30,9 @@ MAX_WORKERS = 16  # 并发下载数
 TIMEOUT = 10  # 请求超时时间（秒）
 
 # ============ 拼接设置 ============
-OUTPUT_FILE = "merged_map.png"  # 输出文件名
+# 拼接引擎为 Rust（merge_rs_cli.py / GUI），输出分块 BigTIFF（.tif，无损、内存恒定）。
+# 若改为 .png 扩展名，Rust 引擎将输出单张 PNG。
+OUTPUT_FILE = "merged_map.tif"  # 输出文件名
 
 # ============ 请求头（模拟浏览器） ============
 HEADERS = {

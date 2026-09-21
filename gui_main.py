@@ -25,7 +25,6 @@ import wx
 
 import config as cfg
 import download_tiles as dt_mod
-import merge_tiles as mt_mod
 import tile_cache
 import httpx
 from tile_path import ensure_tile_dir, find_tile, iter_tiles, tile_path
@@ -820,8 +819,6 @@ class WMTSFrame(wx.Frame):
         self._dl_start = 0.0
         self._dl_stats = {}
         self._fetch_seq = 0  # 网络预览请求序号，用于丢弃过期结果
-        self._merge_mode = "batch"
-        self._save_mode = "fast"
 
         # ---------- 布局 ----------
         root = wx.BoxSizer(wx.VERTICAL)
@@ -989,33 +986,13 @@ class WMTSFrame(wx.Frame):
         nb.AddPage(mg_page, " 拼接大图 ")
         mg_sizer = wx.BoxSizer(wx.VERTICAL)
 
-        mg_sizer.Add(wx.StaticText(mg_page, label="拼接模式:"), 0, wx.BOTTOM, 4)
-        self.mode_radio = wx.RadioBox(mg_page, choices=["批量模式（平衡速度与内存）", "流式模式（低内存）", "超低内存模式（超大图）"],
-                                      style=wx.RA_SPECIFY_ROWS)
-        self.mode_radio.Bind(wx.EVT_RADIOBOX, lambda e: self._update_merge_ui())
-        mg_sizer.Add(self.mode_radio, 0, wx.EXPAND)
-
-        mg_sizer.Add(wx.StaticText(mg_page, label="保存模式:"), 0, wx.TOP | wx.BOTTOM, 4)
-        self.save_radio = wx.RadioBox(mg_page, choices=["快速保存（速度优先）", "优化压缩（文件更小）"],
-                                      style=wx.RA_SPECIFY_ROWS)
-        mg_sizer.Add(self.save_radio, 0, wx.EXPAND)
-
-        self.batch_rows_ctrl = wx.SpinCtrl(mg_page, min=1, max=200, initial=10)
-        row = wx.BoxSizer(wx.HORIZONTAL)
-        row.Add(wx.StaticText(mg_page, label="每批处理行数:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 6)
-        row.Add(self.batch_rows_ctrl, 0)
-        mg_sizer.Add(row, 0, wx.TOP, 8)
-
-        # Rust 引擎（超大图推荐：内存恒定、并行压缩）
-        self.rust_chk = wx.CheckBox(mg_page, label="使用 Rust 引擎（内存恒定，适合超大图）")
-        self.rust_chk.Bind(wx.EVT_CHECKBOX, lambda e: self._update_merge_ui())
-        mg_sizer.Add(self.rust_chk, 0, wx.TOP, 10)
+        mg_sizer.Add(wx.StaticText(mg_page, label="输出格式（Rust 引擎）:"), 0, wx.BOTTOM, 4)
         self.rust_fmt_radio = wx.RadioBox(
             mg_page,
-            choices=["BigTIFF 分块（推荐，无损）", "单张 PNG"],
+            choices=["BigTIFF 分块（.tif，推荐，无损）", "单张 PNG"],
             style=wx.RA_SPECIFY_ROWS,
         )
-        mg_sizer.Add(self.rust_fmt_radio, 0, wx.EXPAND | wx.TOP, 4)
+        mg_sizer.Add(self.rust_fmt_radio, 0, wx.EXPAND)
 
         self.mg_progress = wx.Gauge(mg_page, range=1000)
         mg_sizer.Add(wx.StaticText(mg_page, label="拼接进度:"), 0, wx.TOP | wx.BOTTOM, 8)
@@ -1025,23 +1002,12 @@ class WMTSFrame(wx.Frame):
 
         mg_sizer.AddStretchSpacer(1)
         mg_page.SetSizer(mg_sizer)
-        self._update_merge_ui()
 
     # ================= 配置读写 =================
     def _browse_dir(self):
         with wx.DirDialog(self, "选择保存目录", defaultPath=self.out_dir_ctrl.GetValue()) as dlg:
             if dlg.ShowModal() == wx.ID_OK:
                 self.out_dir_ctrl.SetValue(dlg.GetPath())
-
-    def _update_merge_ui(self):
-        """根据拼接模式启用/禁用相应控件"""
-        if not hasattr(self, "mode_radio"):
-            return
-        use_rust = self.rust_chk.GetValue()
-        self.mode_radio.Enable(not use_rust)
-        self.save_radio.Enable(not use_rust)
-        self.batch_rows_ctrl.Enable(not use_rust and self.mode_radio.GetSelection() == 0)
-        self.rust_fmt_radio.Enable(use_rust)
 
     def _read_ui(self):
         """从 UI 读取配置"""
@@ -1118,7 +1084,7 @@ class WMTSFrame(wx.Frame):
             "layer": cfg.LAYER, "style": "default",
             "tile_matrix": 16, "col_start": 52792, "col_end": 52838,
             "row_start": 10467, "row_end": 10497,
-            "output_dir": "tiles", "output_file": "merged_map.png",
+            "output_dir": "tiles", "output_file": "merged_map.tif",
             "max_workers": 16, "timeout": 10,
         }
         self._apply_ui(d)
@@ -1141,7 +1107,7 @@ class WMTSFrame(wx.Frame):
             self.range_hint.SetLabel("范围无效")
 
     def _sync_core_modules(self):
-        """将 UI 配置写入 config 模块，并同步到 download_tiles / merge_tiles 的全局变量"""
+        """将 UI 配置写入 config 模块，并同步到 download_tiles 的全局变量"""
         d = self._read_ui()
         cfg.BASE_URL = d["base_url"]
         cfg.LAYER = d["layer"]
@@ -1162,14 +1128,6 @@ class WMTSFrame(wx.Frame):
         dt_mod.TIMEOUT = cfg.TIMEOUT
         dt_mod.HEADERS = cfg.HEADERS
         dt_mod.get_tile_url = cfg.get_tile_url
-
-        mt_mod.TILES_DIR = cfg.OUTPUT_DIR
-        mt_mod.TILE_MATRIX = cfg.TILE_MATRIX
-        mt_mod.TILE_COL_START = cfg.TILE_COL_START
-        mt_mod.TILE_COL_END = cfg.TILE_COL_END
-        mt_mod.TILE_ROW_START = cfg.TILE_ROW_START
-        mt_mod.TILE_ROW_END = cfg.TILE_ROW_END
-        mt_mod.OUTPUT_FILE = cfg.OUTPUT_FILE
 
     def _refresh_all(self):
         self.grid.set_range(cfg.TILE_MATRIX, cfg.TILE_COL_START, cfg.TILE_COL_END,
@@ -1332,42 +1290,16 @@ class WMTSFrame(wx.Frame):
 
     def _capture_merge_params(self):
         return {
-            "use_rust": self.rust_chk.GetValue(),
-            "mode": self.mode_radio.GetSelection(),  # 0=batch 1=streaming 2=lowmem
-            "use_fast": self.save_radio.GetSelection() == 0,  # fast=True / optimize=False
-            "batch_rows": self.batch_rows_ctrl.GetValue(),
+            "use_rust": True,
             "rust_fmt": self.rust_fmt_radio.GetSelection(),  # 0=BigTIFF 1=PNG
         }
 
     def _thread_merge(self):
         params = getattr(self, "_merge_params", None)
         if params is None:
-            wx.CallAfter(self._log, "警告: 拼接参数未缓存，使用默认参数(批量模式/快速保存)")
-            params = {"use_rust": False, "mode": 0, "use_fast": True, "batch_rows": 10, "rust_fmt": 0}
-
-        if params.get("use_rust"):
-            self._thread_merge_rust(params)
-        else:
-            self._thread_merge_python(params)
-
-    def _thread_merge_python(self, params):
-        mode, use_fast, batch_rows = params["mode"], params["use_fast"], params["batch_rows"]
-
-        def cb(info):
-            wx.CallAfter(self._on_merge_progress, info)
-
-        self._merge_start = time.time()
-        try:
-            if mode == 0:
-                result = mt_mod.merge_tiles_ultra(use_fast_save=use_fast, batch_rows=batch_rows, progress_callback=cb)
-            elif mode == 1:
-                result = mt_mod.merge_tiles_streaming_v2(use_fast_save=use_fast, progress_callback=cb)
-            else:
-                result = mt_mod.merge_tiles_low_memory(use_fast_save=use_fast, progress_callback=cb)
-            wx.CallAfter(self._on_merge_done, bool(result))
-        except Exception as e:
-            wx.CallAfter(self._log, f"拼接发生异常: {e}")
-            wx.CallAfter(self._on_merge_done, False)
+            wx.CallAfter(self._log, "警告: 拼接参数未缓存，使用默认参数(BigTIFF)")
+            params = {"use_rust": True, "rust_fmt": 0}
+        self._thread_merge_rust(params)
 
     def _thread_merge_rust(self, params):
         """调用 Rust 引擎（merge_rs）执行合并，解析 JSON 进度"""

@@ -3,14 +3,15 @@
 WMTS 瓦片合并 - Rust 引擎便捷入口
 
 读取 config.py 的配置，调用 merge_rs/ 里的 Rust 二进制执行合并。
-相比 Python 版（merge_tiles.py）：
+Rust 是唯一的拼接引擎：
   - 内存峰值恒定（分块 BigTIFF 模式），几十 GB 超大图也不怕 OOM
   - 8 核并行压缩，速度提升数倍
   - 默认输出分块 BigTIFF（无损），超大图可被 QGIS/GIMP/ImageMagick 打开
 
 用法：
-  uv run python merge_rs_cli.py                    # 按 config.py 输出（默认 .png → PNG）
-  uv run python merge_rs_cli.py --format tif       # 强制输出分块 BigTIFF（推荐超大图）
+  uv run python merge_rs_cli.py                    # 默认输出分块 BigTIFF（.tif）
+  uv run python merge_rs_cli.py --format tif       # 显式指定 BigTIFF（默认）
+  uv run python merge_rs_cli.py --format png       # 单张 PNG
   uv run python merge_rs_cli.py --out big.tif      # 指定输出文件
   uv run python merge_rs_cli.py --threads 8 --level 6
 
@@ -43,8 +44,8 @@ def main() -> None:
     p.add_argument(
         "--format",
         choices=["tif", "png"],
-        default=None,
-        help="输出格式：tif=分块BigTIFF（默认，内存恒定）；png=单张PNG（按扩展名自动判断）",
+        default="tif",
+        help="输出格式：tif=分块BigTIFF（默认，内存恒定）；png=单张PNG",
     )
     p.add_argument(
         "--out", default=None, help="输出文件路径（默认 config.py 的 OUTPUT_FILE）"
@@ -81,8 +82,7 @@ def main() -> None:
         "--out",
         out,
     ]
-    if args.format:
-        cmd += ["--format", args.format]
+    cmd += ["--format", args.format]
     if args.threads:
         cmd += ["--threads", str(args.threads)]
     if args.level is not None:
