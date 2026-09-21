@@ -1,0 +1,15 @@
+[package]
+name = "merge_rs"
+version = "0.1.0"
+edition = "2021"
+description = "WMTS 瓦片合并工具（Rust 重写）：超大图内存恒定、并行压缩"
+
+[dependencies]
+png = "0.18"
+libdeflater = "1.26"
+flate2 = "1"
+rayon = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"

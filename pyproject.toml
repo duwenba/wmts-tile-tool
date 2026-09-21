@@ -1,0 +1,23 @@
+[project]
+name = "wmts-tile-tool"
+version = "0.1.0"
+description = "WMTS 瓦片下载与拼接工具（Python + Rust 高速合并引擎）"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "pillow>=12.1.1",
+    "requests>=2.32.5",
+    "tqdm>=4.66.0",
+    "httpx>=0.27.0",
+    "aiofiles>=24.1.0",
+    "h2>=4.1.0",
+    "numpy>=1.24.0",
+    "psutil>=5.9.0",
+    "wxpython>=4.2.5",
+    "socksio>=1.0.0",
+]
+
+[tool.uv.sources]
+# wxPython 官方在 PyPI 上没有 Linux wheel，此处固定使用官方 extras 仓库的
+# Ubuntu 24.04 构建（glibc 2.39+，可兼容 Arch/CachyOS 等发行版）
+wxpython = { url = "https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04/wxpython-4.2.5-cp314-cp314-linux_x86_64.whl" }

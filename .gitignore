@@ -1,0 +1,28 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# 下载的瓦片
+tiles/
+
+# 生成的拼接图
+merged_map.png
+
+# 索引文件
+tile_index.txt
+gui_config*
+
+# 下载进度和失败列表
+download_progress.json
+download_failed.txt
+
+# Rust 构建产物
+merge_rs/target/
+merged_map.tif
