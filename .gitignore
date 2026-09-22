@@ -26,3 +26,4 @@ download_failed.txt
 # Rust 构建产物
 merge_rs/target/
 merged_map.tif
+info.json

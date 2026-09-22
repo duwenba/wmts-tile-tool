@@ -17,17 +17,47 @@
 
 ## 🚀 快速开始
 
+### 一键构建（推荐）
+
 ```bash
 # 1. 克隆仓库
 git clone https://github.com/duwenba/wmts-tile-tool.git
 cd wmts-tile-tool
 
-# 2. 安装依赖（uv + wxPython）
-uv sync
+# 2. 一键构建（安装 Python 依赖 + 编译 Rust 引擎 + 自检）
+./build.sh
 
 # 3. 启动图形界面（推荐）
 uv run python gui_main.py
 ```
+
+`build.sh` 自动完成全部构建步骤：检查前置依赖（uv / Rust 工具链）→ `uv sync` 安装依赖 →
+`cargo build --release` 编译 Rust 引擎 → 构建自检，并输出常用命令提示。可重复执行（幂等），
+中断后重跑即可继续；也支持分步与自定义参数：
+
+```bash
+./build.sh --clean        # 强制全量重建（重装依赖 + 清理 cargo 产物）
+./build.sh --skip-rust    # 只装 Python 依赖
+./build.sh --skip-uv      # 只编译 Rust 引擎
+./build.sh --no-check     # 跳过构建后自检（更快）
+./build.sh --help         # 查看全部用法
+```
+
+**Windows 版**（PowerShell 5.1 / 7 均可，用法与 Linux 版一一对应）：
+
+```powershell
+# 在仓库根目录打开 PowerShell，执行：
+.\build.ps1                      # 一键构建
+.\build.ps1 -Clean               # 强制全量重建
+.\build.ps1 -SkipRust            # 只装 Python 依赖
+.\build.ps1 -SkipUv              # 只编译 Rust 引擎
+.\build.ps1 -NoCheck             # 跳过构建后自检
+.\build.ps1 -Help                # 查看全部用法
+```
+
+> 若提示“无法加载脚本”，先执行 `Set-ExecutionPolicy -Scope Process Bypass` 或右键脚本 →
+> “使用 PowerShell 运行”。Windows 上 wxPython 自动使用 PyPI 官方 wheel（4.3.x），
+> 无需额外配置（见下文「wxPython 跨平台安装」）。
 
 > ⚠️ 首次使用前，请先在 `config.py` 中配置目标 WMTS 服务的 URL 与下载范围（见下文「配置参数」）。
 
@@ -36,6 +66,8 @@ uv run python gui_main.py
 | 文件 | 说明 |
 |------|------|
 | `config.py` | **统一配置文件**（下载与拼接参数都在此修改） |
+| `build.sh` | **一键构建脚本（Linux/macOS）**（装依赖 + 编译 Rust 引擎 + 自检） |
+| `build.ps1` | **一键构建脚本（Windows，PowerShell）** |
 | `download_tiles_async.py` | 异步下载脚本（HTTP/2，推荐） |
 | `download_tiles.py` | 同步下载脚本 |
 | `merge_rs_cli.py` | **Rust 合并引擎便捷入口（拼接入口）** |
@@ -43,6 +75,7 @@ uv run python gui_main.py
 | `gui_main.py` | **wxPython 图形界面**（推荐使用） |
 | `tile_path.py` | 缓存路径统一管理（新旧目录结构兼容） |
 | `tile_cache.py` | 缓存管理 CLI（统计 / 清理 / 迁移 / 校验） |
+| `geo_attach.py` | 为合并后的 TIFF 附加地理信息（GeoTIFF 标签，一次性修补） |
 | `tiles/` | 瓦片缓存目录（自动创建，分级结构） |
 
 ## ⚙️ 配置参数
@@ -63,6 +96,59 @@ OUTPUT_FILE = "merged_map.tif"   # 输出文件名（默认 Rust 引擎分块 Bi
 ```
 
 > 如需更换数据源，请更新 `BASE_URL`、`LAYER` 与 `HEADERS`（部分服务需要 Cookie 鉴权）。
+
+## 🗺️ 数据源：湖北省地质大数据平台（geocloud.hubgs.com）
+
+本配置默认的数据源为**湖北省地质局「地质大数据平台」**（[geocloud.hubgs.com](http://geocloud.hubgs.com)），
+其核心应用「湖北省地质一张图」对外提供多专业、多比例尺地质空间数据 Web 地图服务。
+后端为**中地数码 MapGIS IGServer**（国产 GIS 平台）。
+
+### 瓦片接口
+
+- **元数据**（瓦片格网定义）：`/api/igs/rest/mrcs/tiles/{layer}?f=json&v=2.0`，
+  返回 `tileInfo`（切片原点、分辨率、级别、坐标系等），如仓库内 `info.json`。
+- **取图**：OGC 标准 WMTS `GetTile`，`tilematrixset=EPSG:4326`：
+
+```
+https://geocloud.hubgs.com/api/igs/rest/ogc/WMTSServer?layer={layer}&style=default&tilematrixset=EPSG:4326&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image/png&TileMatrix={z}&TileCol={col}&TileRow={row}
+```
+
+### 瓦片格网规则（来自 `info.json`）
+
+| 项 | 值 |
+|---|---|
+| 原点 Origin | (-180°, 90°)（左上角） |
+| 瓦片尺寸 | 256 × 256 |
+| 级别 | 0–18，共 19 级 |
+| 0 级分辨率 | 1.40625°（= 360°/256），逐级减半 |
+| 坐标系 | 对外 `EPSG:4326`；底层标注为西安80（地理坐标，度），两者网格一致 |
+
+### 图层
+
+| 图层编号 | 覆盖范围 | 备注 |
+|---|---|---|
+| `WMTS020101010007021` | 109.49–111.02°E, 31.99–33.01°N（**十堰一带**，含丹江口水库西缘） | 元数据见 `info.json`，`test.html` 可做坐标→瓦片换算 |
+| `WMTS020101010007006` | 112.5–114.0°E, 31.0–32.0°N（**随州—孝感一带**） | `config.py` 当前配置，matrix 16 共 274×183 瓦片 |
+
+### 内容判定（地质专题图）
+
+对已合并的 `merged_map.tif`（图层 006，matrix 16 ≈ 2.4 m/px）做像素特征分析：
+
+- **矢量图斑风格**：整图仅约 95 种颜色（8× 采样），非遥感影像；图斑边界清晰、文字线划多。
+- **配色符合地质图惯例**：浅黄 42.9%（第四系松散沉积）、黄绿 27.8%、紫红（红层，如广水北部大块图斑）、
+  蓝 = 水系 4.2%、黑 = 线划/文字 3.5%。
+- 部分下载区域为纯色背景（超出图层有效范围，属正常）。
+
+结合平台性质，两个图层为**湖北地质一张图发布的地质专题图**（区域地质/基础地质类），
+图层编号为平台内部目录编码，精确图名需登录平台目录查看。
+
+### 鉴权说明
+
+瓦片与 GetCapabilities 接口均校验登录 Cookie，Cookie 过期后返回 `{"error":"操作权限不足","status":405}`。
+如需重新下载，请先在浏览器登录平台并更新 `config.py` 中 `HEADERS` 的 `Cookie`。
+
+> 📌 补充：`merged_map.tif` 为分块 BigTIFF，但偏移表用 `StripOffsets`(tag 273, LONG8) 而非 `TileOffsets`，
+> ffmpeg / ImageMagick 解析失败，可按 256×256 分块逐块 zlib 解压后用 numpy 直接读取（本次分析即用此法）。
 
 ## 📥 下载瓦片
 
@@ -118,6 +204,25 @@ merge_rs/target/release/merge_rs --tiles-dir tiles \
    - `png`：单张 PNG 流式写出（Sub 滤波 + zlib），内存 ≈ 一条瓦片行，适合中等成图。
 4. **行为说明**：源瓦片展开为 RGB 并丢弃 alpha（等价 `convert('RGB')`），缺失瓦片填黑。
 
+## 🗺️ 附加地理信息（GeoTIFF）
+
+Rust 引擎输出的 TIFF 默认不含地理参考。合并完成后运行 `geo_attach.py`：
+它读取 `config.py` 的下载范围与 `info.json` 的瓦片格网定义，自动计算左上角地理坐标与
+像素分辨率，把 GeoTIFF 标签（ModelPixelScale / ModelTiepoint / GeoKeyDirectory）写入
+TIFF，使 QGIS / GDAL / ArcGIS 能按真实经纬度配准显示：
+
+```bash
+uv run python geo_attach.py            # 修补 merged_map.tif（默认 config.py 的 OUTPUT_FILE）
+uv run python geo_attach.py --dry-run  # 先预览计算出的地理范围，不写文件
+uv run python geo_attach.py --file x.tif --epsg 4610   # 自定义文件 / 坐标系
+```
+
+- **坐标系**：默认 EPSG:4326（WGS84，服务对外坐标系）；更换数据源时可 `--epsg` 指定其它编码。
+- **安全性**：只在文件末尾追加【地理标签数据 + 新 IFD】并回填文件头 8 字节，原瓦片数据字节不变；
+  脚本会打印旧 IFD 偏移，必要时可改回文件头还原。
+- 重新拼接生成新 TIFF 后需再次运行本脚本（文件尺寸与 config.py 不一致时会拒绝并提示 `--force`）。
+
+
 ## 🖥️ 图形界面（wxPython）
 
 ```bash
@@ -135,11 +240,16 @@ uv run python gui_main.py
 
 > 配置保存在 `gui_config.json`（启动时自动加载），也可在界面上恢复默认或写回配置。
 
-### wxPython 安装说明（Linux）
+### wxPython 跨平台安装
 
-wxPython 在 PyPI 上没有 Linux 预编译包。本项目已在 `pyproject.toml` 中通过 `[tool.uv.sources]`
-固定指向官方 extras 仓库的 Ubuntu 24.04 构建（glibc 2.39+，兼容 Arch/CachyOS 等发行版），`uv sync` 即可。
-若在其他发行版/架构使用，见 [FAQ](#其他-linux-发行版架构装不上-wxpython-怎么办)。
+wxPython 在 PyPI 上没有 Linux 预编译包，但 Windows/macOS 有官方 wheel。
+`pyproject.toml` 已按平台自动分流，`uv sync` 无需任何手动配置：
+
+- **Linux**：自动使用官方 extras 仓库的 Ubuntu 24.04 构建（glibc 2.39+，兼容 Arch/CachyOS 等发行版），
+  并按 Python 版本（3.11–3.14）匹配对应 wheel；
+- **Windows / macOS**：自动回退到 PyPI 官方 wheel（wxPython 4.3.x）。
+
+若在其他 Linux 发行版/架构使用，见 [FAQ](#其他-linux-发行版架构装不上-wxpython-怎么办)。
 
 ## 🗃️ 缓存管理
 
@@ -203,7 +313,7 @@ cat download_failed.txt                  # 查看失败列表（如有）
 
 wxPython 在 PyPI 上没有 Linux 预编译包。请到
 https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ 选择对应发行版/架构的 wheel，
-修改 `pyproject.toml` 中 `[tool.uv.sources]` 的 `wxpython` URL 后重新 `uv sync`。
+修改 `pyproject.toml` 中 `[tool.uv.sources]` 的 `wxpython` 各 URL（保持 marker 分版本写法）后重新 `uv lock && uv sync`。
 
 ### 没有 Rust 工具链还能用吗？
 
