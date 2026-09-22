@@ -244,10 +244,14 @@ class TileGridPanel(wx.Panel):
             return None
         arr = np.zeros((nrows, ncols), dtype=np.uint8)
         out_dir = self.frame.config.output_dir
+        layer = self.frame.config.layer
         if not os.path.isdir(out_dir):
             return arr
         try:
-            for m, col, row, _path in iter_tiles(out_dir):
+            for lay, m, col, row, _path in iter_tiles(out_dir):
+                # 只统计当前图层（None = 旧结构未分层，按当前图层兼容处理）
+                if lay not in (None, layer):
+                    continue
                 if m == matrix and cs <= col <= ce and rs <= row <= re:
                     arr[row - rs, col - cs] = GRID_OK
         except OSError:
@@ -685,7 +689,8 @@ class PreviewPanel(wx.Panel):
                 src_txt = "本地文件（已存在）"
                 loc_line = f"路径: {path}"
             else:
-                target = tile_path(matrix, col, row, self.frame.config.output_dir)
+                target = tile_path(matrix, col, row, self.frame.config.output_dir,
+                                   layer=self.frame.config.layer)
                 src_txt = "网络获取（未保存）" if self._unsaved else "网络获取"
                 loc_line = f"保存位置: {target}（可点「保存瓦片」）"
             self.info_ctrl.SetValue(
@@ -1372,20 +1377,21 @@ class CacheManageDialog(wx.Dialog):
         self.result_txt.SetLabel(msg)
 
     def refresh_stats(self):
-        total, size, per = core_cache.cache_stats(self.base)
+        total, size, per_layer = core_cache.cache_stats(self.base)
 
         def fmt_mb(n):
             return f"{n / (1024 * 1024):.1f} MB"
 
         lines = [f"缓存目录: {self.base}",
-                 f"总瓦片数: {total} | 总大小: {fmt_mb(size)}", "-" * 64,
-                 f"{'级别':<6}{'瓦片数':>10}{'大小':>12}{'列范围':>18}{'行范围':>18}"]
-        for m in sorted(per):
-            v = per[m]
-            col_rng = f"{v['min_col']}-{v['max_col']}" if v["min_col"] is not None else "-"
-            row_rng = f"{v['min_row']}-{v['max_row']}" if v["min_row"] is not None else "-"
-            lines.append(f"{m:<6}{v['tiles']:>10}{fmt_mb(v['size']):>12}"
-                         f"{col_rng:>18}{row_rng:>18}")
+                 f"总瓦片数: {total} | 总大小: {fmt_mb(size)}",
+                 f"当前图层: {self.config.layer}", "-" * 66,
+                 f"{'图层':<24}{'级别':>6}{'瓦片数':>10}{'大小':>12}{'列范围':>18}"]
+        for label in sorted(per_layer):
+            for m in sorted(per_layer[label]):
+                v = per_layer[label][m]
+                col_rng = f"{v['min_col']}-{v['max_col']}" if v["min_col"] is not None else "-"
+                lines.append(f"{label:<24}{m:>6}{v['tiles']:>10}{fmt_mb(v['size']):>12}"
+                             f"{col_rng:>18}")
         self.stats_txt.SetValue("\n".join(lines))
 
     def on_op_done(self, err, result):
@@ -1397,9 +1403,10 @@ class CacheManageDialog(wx.Dialog):
         if not result:
             self.result_txt.SetLabel("完成（无变化）")
         elif kind == "migrate":
-            moved, left = result
-            extra = f"，目标已存在跳过 {left} 个" if left else ""
-            self.result_txt.SetLabel(f"完成：迁移 {moved} 个瓦片{extra}")
+            moved, skipped, left = result
+            extra = f"，目标已存在跳过 {skipped} 个" if skipped else ""
+            extra += f"，旧位置仍剩 {left} 个" if left else ""
+            self.result_txt.SetLabel(f"完成：迁移到图层 {self.config.layer}，移动 {moved} 个{extra}")
         else:
             removed, freed = result
             self.result_txt.SetLabel(
@@ -1426,26 +1433,26 @@ class CacheManageDialog(wx.Dialog):
 
     def _on_prune_matrix(self, _evt):
         m = self.matrix_ctrl.GetValue()
-        if wx.MessageBox(f"删除级别 {m} 的全部瓦片？", "确认清理",
+        if wx.MessageBox(f"删除级别 {m}（图层 {self.config.layer}）的全部瓦片？", "确认清理",
                          wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self._run(core_cache.prune_matrix, "prune", m)
+            self._run(core_cache.prune_matrix, "prune", m, self.config.layer)
 
     def _on_prune_old(self, _evt):
         days = self.days_ctrl.GetValue()
-        if wx.MessageBox(f"删除 {days} 天前下载的所有瓦片？", "确认清理",
+        if wx.MessageBox(f"删除 {days} 天前下载的所有瓦片（图层 {self.config.layer}）？", "确认清理",
                          wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self._run(core_cache.prune_older_than, "prune", days)
+            self._run(core_cache.prune_older_than, "prune", days, self.config.layer)
 
     def _on_prune_size(self, _evt):
         mb = self.maxsize_ctrl.GetValue()
-        if wx.MessageBox(f"按最旧优先删除，直到缓存 ≤ {mb} MB？", "确认清理",
+        if wx.MessageBox(f"按最旧优先删除，直到缓存 ≤ {mb} MB（图层 {self.config.layer}）？", "确认清理",
                          wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self._run(core_cache.prune_to_max_size, "prune", mb)
+            self._run(core_cache.prune_to_max_size, "prune", mb, self.config.layer)
 
     def _on_migrate(self, _evt):
-        if wx.MessageBox("把旧扁平结构瓦片迁移到分级目录？", "确认迁移",
+        if wx.MessageBox(f"把旧结构瓦片迁移到图层 {self.config.layer} 的分层目录？", "确认迁移",
                          wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self._run(core_cache.migrate, "migrate")
+            self._run(core_cache.migrate, "migrate", self.config.layer)
 
     def _on_clear(self, _evt):
         if wx.MessageBox("清空全部缓存瓦片？此操作不可恢复！", "确认清空",

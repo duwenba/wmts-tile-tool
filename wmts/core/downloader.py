@@ -200,8 +200,9 @@ class AsyncTileDownloader:
 
             url = self.config.tile_url(tile_matrix, tile_col, tile_row)
 
-            # 断点续传：新/旧结构任一已存在且有效则跳过
-            existing = find_tile(tile_matrix, tile_col, tile_row, self.output_dir)
+            # 断点续传：当前图层（v3）或旧结构任一已存在且有效则跳过
+            existing = find_tile(tile_matrix, tile_col, tile_row, self.output_dir,
+                                 layer=self.config.layer)
             if existing is not None:
                 if self._is_valid_png(existing):
                     self.skip_count += 1
@@ -220,9 +221,11 @@ class AsyncTileDownloader:
 
             dir_key = (tile_matrix, tile_row)
             if dir_key not in self._created_dirs:
-                ensure_tile_dir(tile_matrix, tile_row, self.output_dir)
+                ensure_tile_dir(tile_matrix, tile_row, self.output_dir,
+                                layer=self.config.layer)
                 self._created_dirs.add(dir_key)
-            filepath = tile_path(tile_matrix, tile_col, tile_row, self.output_dir)
+            filepath = tile_path(tile_matrix, tile_col, tile_row, self.output_dir,
+                                 layer=self.config.layer)
             filename = f"{tile_matrix}_{tile_col}_{tile_row}"
 
             last_exc = None

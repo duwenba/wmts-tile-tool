@@ -219,6 +219,7 @@ def tiles_status(
     matrix: int | None = None,
     col_start: int | None = None, col_end: int | None = None,
     row_start: int | None = None, row_end: int | None = None,
+    layer: str | None = None,
 ) -> dict:
     """范围内瓦片状态位图（2 bit/片，base64），供前端状态网格渲染。"""
     cfg = _state.config
@@ -232,10 +233,11 @@ def tiles_status(
     if (ce - cs + 1) * (re_ - rs + 1) > 4_000_000:
         raise HTTPException(400, "范围过大")
     counts, packed = range_status(str(cfg.resolve_path(cfg.output_dir)),
-                                  matrix, cs, ce, rs, re_)
+                                  matrix, cs, ce, rs, re_,
+                                  layer=layer or cfg.layer)
     return {
         "matrix": matrix, "col_start": cs, "col_end": ce,
-        "row_start": rs, "row_end": re_,
+        "row_start": rs, "row_end": re_, "layer": layer or cfg.layer,
         "cols": ce - cs + 1, "rows": re_ - rs + 1,
         "counts": counts, "status_b64": packed,
     }
@@ -269,7 +271,8 @@ def save_tile(matrix: int, col: int, row: int,
             path = tile_preview.save_tile(cfg, matrix, col, row, content)
         else:
             path = cfg.resolve_path(tile_path(matrix, col, row,
-                                              str(cfg.resolve_path(cfg.output_dir))))
+                                              str(cfg.resolve_path(cfg.output_dir)),
+                                              layer=cfg.layer))
             if not Path(path).exists():
                 raise HTTPException(404, "本地不存在该瓦片")
     except AuthError as e:
@@ -446,9 +449,11 @@ async def logs_stream(request: Request):
 @app.get("/api/cache/stats")
 def cache_statistics() -> dict:
     base = str(_state.config.resolve_path(_state.config.output_dir))
-    total, size, per = cache_stats(base)
+    total, size, per_layer = cache_stats(base)
+    per_out = {label: {str(m): v for m, v in mats.items()}
+               for label, mats in per_layer.items()}
     return {"base": base, "total_tiles": total, "total_bytes": size,
-            "per_matrix": {str(k): v for k, v in per.items()}}
+            "current_layer": _state.config.layer, "per_layer": per_out}
 
 
 class CachePruneRequest(BaseModel):
@@ -459,33 +464,49 @@ class CachePruneRequest(BaseModel):
     row_end: int | None = None
     older_than: int | None = Field(None, description="删除 N 天前的瓦片")
     max_size: int | None = Field(None, description="删最旧直到 ≤ N MB")
+    layer: str | None = Field(None, description="只清理该图层（默认当前图层；all=全部）")
 
 
 @app.post("/api/cache/prune")
 def cache_prune(req: CachePruneRequest) -> dict:
     base = str(_state.config.resolve_path(_state.config.output_dir))
+    if req.layer == "all":
+        layer = None
+    elif req.layer:
+        layer = req.layer
+    else:
+        layer = _state.config.layer
     try:
-        removed, freed = prune(base, matrix=req.matrix,
+        removed, freed = prune(base, layer=layer, matrix=req.matrix,
                                col_start=req.col_start, col_end=req.col_end,
                                row_start=req.row_start, row_end=req.row_end,
                                older_than=req.older_than, max_size=req.max_size)
     except ValueError as e:
         raise HTTPException(400, str(e))
-    return {"ok": True, "removed": removed, "freed_bytes": freed}
+    return {"ok": True, "removed": removed, "freed_bytes": freed,
+            "layer": layer or "all"}
 
 
 @app.post("/api/cache/migrate")
-def cache_migrate(dry_run: bool = False) -> dict:
+def cache_migrate(dry_run: bool = False, layer: str | None = None) -> dict:
+    """把旧结构（v1 扁平 / v2 无图层）迁移到按图层分层结构。"""
     base = str(_state.config.resolve_path(_state.config.output_dir))
-    moved, left = migrate(base, dry_run=dry_run)
-    return {"ok": True, "moved": moved, "skipped": left, "dry_run": dry_run}
+    target_layer = layer or _state.config.layer
+    try:
+        moved, skipped, left = migrate(base, target_layer, dry_run=dry_run)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"ok": True, "layer": target_layer, "moved": moved,
+            "skipped": skipped, "legacy_left": left, "dry_run": dry_run}
 
 
 @app.post("/api/cache/verify")
-def cache_verify() -> dict:
+def cache_verify(all_layers: bool = False, layer: str | None = None) -> dict:
     base = str(_state.config.resolve_path(_state.config.output_dir))
-    total, bad = verify(base)
-    return {"ok": True, "total": total, "bad_count": len(bad), "bad": bad[:100]}
+    scope = None if all_layers else (layer or _state.config.layer)
+    total, bad = verify(base, layer=scope)
+    return {"ok": True, "layer": scope or "all", "total": total,
+            "bad_count": len(bad), "bad": bad[:100]}
 
 
 class CacheClearRequest(BaseModel):

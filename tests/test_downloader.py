@@ -40,10 +40,11 @@ def test_counter_init(config):
     assert dl.auth_error is None
 
 
-def test_tile_path_used_for_saving(config, tmp_path):
-    """保存路径应为 v2 分级结构。"""
-    p = tile_path(config.tile_matrix, 11, 20, config.output_dir)
+def test_tile_path_used_for_saving(config):
+    """保存路径应为 v3 分层结构（含图层）。"""
+    p = tile_path(config.tile_matrix, 11, 20, config.output_dir, layer=config.layer)
     assert p.startswith(config.output_dir)
+    assert f"/{config.layer}/" in p.replace("\\", "/")
     assert p.endswith(".png")
 
 

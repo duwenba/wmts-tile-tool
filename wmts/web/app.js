@@ -371,20 +371,26 @@ async function refreshCache() {
     const r = await api("/api/cache/stats");
     const tb = $("ca-table tbody");
     tb.innerHTML = "";
-    const matrices = Object.keys(r.per_matrix).sort((a, b) => a - b);
-    if (!matrices.length) {
-      tb.innerHTML = `<tr><td colspan="6" class="hint">缓存为空（${r.base}）</td></tr>`;
+    const layers = Object.keys(r.per_layer).sort();
+    if (!layers.length) {
+      tb.innerHTML = `<tr><td colspan="7" class="hint">缓存为空（${r.base}）</td></tr>`;
     }
-    for (const m of matrices) {
-      const v = r.per_matrix[m];
-      tb.insertAdjacentHTML("beforeend", `<tr>
-        <td class="num">${m}</td><td class="num">${v.tiles.toLocaleString()}</td>
-        <td class="num">${fmtBytes(v.size)}</td>
-        <td class="num">${v.min_col ?? "-"} ~ ${v.max_col ?? "-"}</td>
-        <td class="num">${v.min_row ?? "-"} ~ ${v.max_row ?? "-"}</td>
-        <td class="num">${v.rows}</td></tr>`);
+    for (const label of layers) {
+      const isCurrent = label === r.current_layer;
+      for (const m of Object.keys(r.per_layer[label]).sort((a, b) => a - b)) {
+        const v = r.per_layer[label][m];
+        tb.insertAdjacentHTML("beforeend", `<tr>
+          <td>${label}${isCurrent ? " ★" : ""}</td>
+          <td class="num">${m}</td><td class="num">${v.tiles.toLocaleString()}</td>
+          <td class="num">${fmtBytes(v.size)}</td>
+          <td class="num">${v.min_col ?? "-"} ~ ${v.max_col ?? "-"}</td>
+          <td class="num">${v.min_row ?? "-"} ~ ${v.max_row ?? "-"}</td>
+          <td class="num">${v.rows}</td></tr>`);
+      }
     }
-    $("ca-hint").textContent = `总计 ${r.total_tiles.toLocaleString()} 片 / ${fmtBytes(r.total_bytes)}`;
+    $("ca-hint").textContent =
+      `总计 ${r.total_tiles.toLocaleString()} 片 / ${fmtBytes(r.total_bytes)}` +
+      ` · 当前图层 ${r.current_layer} ★（清理默认只作用于它）`;
   } catch (e) { $("ca-hint").textContent = "统计失败: " + e.message; }
 }
 
@@ -556,7 +562,9 @@ function bindEvents() {
   $("ca-migrate").addEventListener("click", async () => {
     try {
       const r = await api("/api/cache/migrate", { method: "POST", body: {} });
-      toast(`迁移完成：移动 ${r.moved} 个文件`);
+      const extra = r.skipped ? `，跳过 ${r.skipped} 个` : "";
+      const left = r.legacy_left ? `，旧位置仍剩 ${r.legacy_left} 个` : "";
+      toast(`迁移到图层 ${r.layer}：移动 ${r.moved} 个${extra}${left}`);
       refreshCache(); refreshGridStatus();
     } catch (e) { toast("失败: " + e.message, true); }
   });

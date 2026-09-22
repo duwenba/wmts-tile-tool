@@ -312,29 +312,37 @@ wxPython 在 PyPI 上没有 Linux 预编译包，但 Windows/macOS 有官方 whe
 
 ## 🗃️ 缓存管理
 
-**缓存结构**（v2 分级，下载与迁移后默认）：
+**缓存结构**（v3，按图层分层；不同图层同一行列的瓦片互不覆盖）：
 
 ```
 tiles/
-└── 16/                 ← 缩放级别
-    └── 10558/          ← 行
-        └── 53248.png   ← 列
+└── WMTS020101010007018/    ← 图层
+    └── 16/                 ← 缩放级别
+        └── 10558/          ← 行
+            └── 53248.png   ← 列
 ```
 
-旧 v1 扁平结构 `tiles/{matrix}_{col}_{row}.png` 仍兼容读取，可用 `migrate` 命令迁移。
+旧结构仍兼容读取，可用 `migrate` 归入指定图层目录：
 
-**命令行**（`tile_cache.py`）：
+- v2（无图层维度）：`tiles/{matrix}/{row}/{col}.png` —— 多图层会互相覆盖，建议迁移
+- v1（扁平）：`tiles/{matrix}_{col}_{row}.png`
+
+> Rust 合并引擎按 `{tiles-dir}/{matrix}/{row}/{col}.png` 扫描，合并时自动把
+> `--tiles-dir` 指向 `tiles/{当前图层}`（见 `wmts/core/merger.py`）。
+
+**命令行**（`tile_cache.py`，`--layer` 可放在子命令前后；默认取当前配置图层）：
 
 ```bash
-uv run python tile_cache.py stats                          # 统计：总量 + 各级别明细
-uv run python tile_cache.py migrate                        # 迁移旧扁平结构到分级结构
-uv run python tile_cache.py prune --matrix 16              # 删除指定级别的全部瓦片
+uv run python tile_cache.py stats                          # 统计：按图层/级别明细
+uv run python tile_cache.py migrate --layer WMTS020101010007018   # 旧结构迁入该图层
+uv run python tile_cache.py prune --matrix 16              # 删除当前图层该级别的全部瓦片
 uv run python tile_cache.py prune --matrix 16 --col-start 53400 --col-end 53410 \
                                  --row-start 10600 --row-end 10610    # 删除范围内瓦片
 uv run python tile_cache.py prune --older-than 30          # 删除 30 天前下载的瓦片
 uv run python tile_cache.py prune --max-size 500           # 删最旧直到缓存 ≤500MB
-uv run python tile_cache.py clear --yes                    # 清空缓存
-uv run python tile_cache.py verify                         # 校验全部瓦片 PNG 完整性
+uv run python tile_cache.py prune --matrix 16 --all-layers # 不限图层
+uv run python tile_cache.py clear --yes                    # 清空缓存（全部图层）
+uv run python tile_cache.py verify                         # 校验当前图层瓦片 PNG 完整性
 ```
 
 ## ⏯️ 断点续传

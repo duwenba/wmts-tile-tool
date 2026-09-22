@@ -42,7 +42,13 @@ wx 薄客户端；Rust（`merge_rs/`）是唯一拼接引擎。文档与注释�
     不会把全部瓦片打成"无效 PNG"。
   - `core/merger.py`：封装 Rust 二进制，stderr `--progress-json` 行解析为事件。
   - `core/georef.py` / `core/cache.py` / `core/preview.py` / `core/paths.py`：地理标签、缓存、
-    单瓦片预览（Cookie 只在服务端用）、v1/v2 缓存路径。
+    单瓦片预览（Cookie 只在服务端用）、**按图层分层的缓存路径**。
+    缓存结构 v3：`tiles/{layer}/{matrix}/{row}/{col}.png`（不同图层同坐标互不覆盖；
+    兼容读取旧 v2 `tiles/{matrix}/{row}/{col}.png` 与 v1 扁平，用
+    `tile_cache.py migrate --layer X` 归入图层）。Rust 合并引擎按
+    `{tiles-dir}/{matrix}/{row}/{col}.png` 扫描，故 `merger.py` 把 `--tiles-dir`
+    指向 `tiles/{layer}`（该图层目录不存在时回退到缓存根）。`iter_tiles` 产出
+    5 元组 `(layer, matrix, col, row, path)`，`layer=None` 表示旧结构未分层。
 - `wmts/tasks.py`：`TaskManager`——**同一时刻只允许一个任务**（download / merge / geo /
   pipeline / retry_failed），占用时 `start()` 抛 `TaskBusyError`。事件带全局自增 `seq` 并写入
   每任务的回放缓冲（SSE 订阅前发出的不丢失）。流水线权重：下载 50% / 拼接 40% / 地理标签 10%。
@@ -73,8 +79,11 @@ wx 薄客户端；Rust（`merge_rs/`）是唯一拼接引擎。文档与注释�
   extras.wxpython.org 的 Ubuntu 24.04 wheel URL（glibc 2.39+）。换发行版/架构或改 Python 版本时
   `uv sync` 可能失败，需改这些 URL（见 README FAQ）后 `uv lock && uv sync`。
   Web 前端不依赖 wxPython——无头机器可用 `uv run python -m wmts.server`。
-- `.gitignore` 覆盖 `tiles/`、`merged_map.tif`、`config.json`、`layer_meta/`、`gui_config*`、
-  下载进度文件；但 `merged_map.tif.aux.xml` 已被跟踪。
+- `.gitignore` 覆盖 `tiles/`、`merged_*.tif`、`merged_*.png`、`config.json`、`layer_meta/`、
+  `gui_config*`、下载进度文件；但 `merged_map.tif.aux.xml` 已被跟踪。
+- 缓存按图层分层：切换图层后状态网格/统计只反映当前图层；清理（prune/verify）默认只作用于
+  当前图层，`--all-layers` 才跨图层。旧结构（未分层）瓦片对所有图层都可见（v2/v1 回退），
+  需尽快 `migrate --layer` 或清空。
 - Rust 输出的 TIFF **不含地理参考**；流水线会自动跑 geo 标签（`auto_geo` 配置），
   手动拼接后需重跑 `uv run python geo_attach.py`（尺寸与配置不一致会拒绝，需 `--force`）。
 

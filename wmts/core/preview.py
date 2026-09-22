@@ -19,7 +19,7 @@ PNG_HEADER = b"\x89PNG\r\n\x1a\n"
 
 def load_tile_local(config: Config, matrix: int, col: int, row: int) -> bytes | None:
     """读取本地缓存瓦片（校验 PNG 头）；不存在或损坏返回 None。"""
-    path = find_tile(matrix, col, row, config.output_dir)
+    path = find_tile(matrix, col, row, config.output_dir, layer=config.layer)
     if path is None:
         return None
     try:
@@ -60,8 +60,8 @@ def get_tile(config: Config, matrix: int, col: int, row: int,
     if source == "local":
         content = load_tile_local(config, matrix, col, row)
         if content is None:
-            raise FileNotFoundError(
-                str(config.resolve_path(tile_path(matrix, col, row, config.output_dir))))
+            raise FileNotFoundError(str(config.resolve_path(
+                tile_path(matrix, col, row, config.output_dir, layer=config.layer))))
         return content, "local"
     if source == "remote":
         return fetch_tile_remote(config, matrix, col, row), "remote"
@@ -73,11 +73,11 @@ def get_tile(config: Config, matrix: int, col: int, row: int,
 
 
 def save_tile(config: Config, matrix: int, col: int, row: int, content: bytes) -> Path:
-    """把瓦片内容写入缓存（v2 分级路径）。"""
+    """把瓦片内容写入缓存（v3 分层路径：{output_dir}/{layer}/{matrix}/{row}/{col}.png）。"""
     if not content.startswith(PNG_HEADER):
         raise ValueError("内容不是有效 PNG，拒绝保存")
     base = config.resolve_path(config.output_dir)
-    path = Path(tile_path(matrix, col, row, str(base)))
-    ensure_tile_dir(matrix, row, str(base))
+    path = Path(tile_path(matrix, col, row, str(base), layer=config.layer))
+    ensure_tile_dir(matrix, row, str(base), layer=config.layer)
     path.write_bytes(content)
     return path

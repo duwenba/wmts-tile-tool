@@ -145,11 +145,11 @@
       <button id="ca-clear" class="danger">清空缓存…</button>
     </div>
     <table id="ca-table" class="table">
-      <thead><tr><th>级别</th><th>瓦片数</th><th>大小</th><th>列范围</th><th>行范围</th><th>行目录数</th></tr></thead>
+      <thead><tr><th>图层</th><th>级别</th><th>瓦片数</th><th>大小</th><th>列范围</th><th>行范围</th><th>行目录数</th></tr></thead>
       <tbody></tbody>
     </table>
     <details>
-      <summary>按条件清理（prune）</summary>
+      <summary>按条件清理（prune，默认只清理当前图层）</summary>
       <div class="grid2">
         <label>级别<input id="ca-matrix" type="number"></label>
         <label>删除 N 天前<input id="ca-older" type="number"></label>

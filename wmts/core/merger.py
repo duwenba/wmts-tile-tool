@@ -57,10 +57,13 @@ def merge_tiles(
     fmt: str = "tif",
     threads: int | None = None,
     level: int | None = None,
+    layer: str | None = None,
 ) -> MergeResult:
     """执行合并并解析进度。阻塞直至子进程退出。
 
     fmt: "tif"（分块 BigTIFF，默认）| "png"（单张 PNG，中小成图）
+    layer: 合并哪个图层的瓦片（默认 config.layer）；瓦片按图层分层存放，
+           Rust 引擎按 {tiles-dir}/{matrix}/{row}/{col}.png 扫描。
     """
     start = time.time()
     bin_path = binary_path()
@@ -74,9 +77,15 @@ def merge_tiles(
         out_path = out_path.with_suffix(".tif")
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 图层目录优先；若该图层尚无缓存则回退到缓存根（兼容旧结构）
+    base_dir = config.resolve_path(config.output_dir)
+    use_layer = layer if layer is not None else config.layer
+    layer_dir = base_dir / use_layer if use_layer else base_dir
+    tiles_dir = layer_dir if layer_dir.is_dir() else base_dir
+
     cmd = [
         str(bin_path),
-        "--tiles-dir", str(config.resolve_path(config.output_dir)),
+        "--tiles-dir", str(tiles_dir),
         "--matrix", str(config.tile_matrix),
         "--col-start", str(config.col_start), "--col-end", str(config.col_end),
         "--row-start", str(config.row_start), "--row-end", str(config.row_end),
