@@ -13,7 +13,7 @@ wheels/
 tiles/
 
 # 生成的拼接图
-merged_map.png
+merged_*.png
 
 # 索引文件
 tile_index.txt
@@ -29,7 +29,7 @@ layer_meta/
 
 # Rust 构建产物
 merge_rs/target/
-merged_map.tif
+merged_*.tif
 info.json
 
 # 下载进度归档备份

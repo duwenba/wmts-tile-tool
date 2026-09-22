@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -69,7 +70,8 @@ class AsyncTileDownloader:
     ):
         self.config = config
         self.on_event = on_event
-        self.cancel_event = cancel_event  # threading.Event，外部可 set() 请求停止
+        # threading.Event，外部可 set() 请求停止；未传时用内部事件（CLI/测试场景）
+        self.cancel_event = cancel_event if cancel_event is not None else threading.Event()
         self.max_workers = config.max_workers
         self.output_dir = config.output_dir
 
@@ -329,15 +331,22 @@ class AsyncTileDownloader:
         workers = [asyncio.create_task(worker()) for _ in range(self.max_workers)]
 
         try:
-            for matrix, col, row in tasks:
+            for item in tasks:
                 if self.cancel_event.is_set() or self.auth_error:
                     break
-                try:
-                    await asyncio.wait_for(q.put((matrix, col, row)), timeout=0.5)
-                except asyncio.TimeoutError:
+                # 队列满时最多等 0.5s 再重试同一片，避免取消信号被满队列阻塞；
+                # 注意：超时后必须重试"当前这片"，否则会静默丢片。
+                placed = False
+                while not placed:
                     if self.cancel_event.is_set() or self.auth_error:
                         break
-                    continue
+                    try:
+                        await asyncio.wait_for(q.put(item), timeout=0.5)
+                        placed = True
+                    except asyncio.TimeoutError:
+                        continue
+                if not placed:
+                    break
             if not self.cancel_event.is_set() and not self.auth_error:
                 for _ in workers:
                     await q.put(None)
