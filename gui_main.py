@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-WMTS 瓦片下载与拼接工具 - wxPython 图形界面
+WMTS 瓦片下载与拼接工具 - wxPython 图形界面（薄客户端）
 
-功能：
-  1. 可视化任务流程（配置参数 → 下载瓦片 → 拼接大图 → 任务完成）及整体进度
-  2. 单个瓦片预览（本地文件 / 网络实时获取），并支持在范围总览网格中点击跳转
-  3. 下载与拼接的实时进度、统计信息、日志输出
+本文件只做 wx 渲染与交互，全部业务逻辑来自 ``wmts`` 包：
+    - 配置      → wmts.core.config.Config（config.json 持久化）
+    - 下载      → wmts.tasks.TaskManager（统一任务编排 + 进度事件）
+    - 拼接      → 同上（Rust 引擎经 wmts.core.merger）
+    - 地理标签  → 同上（wmts.core.georef）
+    - 预览      → wmts.core.preview
+    - 缓存管理  → wmts.core.cache
 
 运行：
     uv run python gui_main.py
@@ -14,27 +17,33 @@ WMTS 瓦片下载与拼接工具 - wxPython 图形界面
 
 import os
 import sys
-import time
-import json
-import subprocess
 import threading
-from pathlib import Path
+import time
 
 import numpy as np
 import wx
 
-import config as cfg
-import download_tiles as dt_mod
-import tile_cache
-import httpx
-from tile_path import ensure_tile_dir, find_tile, iter_tiles, tile_path
+from wmts.core.config import Config
+from wmts.core.events import (
+    EV_DONE,
+    EV_ERROR,
+    EV_LOG,
+    EV_PROGRESS,
+    EV_STATE,
+    STAGE_DOWNLOAD,
+    STAGE_GEO,
+    STAGE_MERGE,
+    STAGE_PIPELINE,
+)
+from wmts.core.paths import iter_tiles, tile_path
+from wmts.core import cache as core_cache
+from wmts.core import preview as core_preview
+from wmts.tasks import TaskBusyError, TaskError, TaskManager
 
-APP_TITLE = "WMTS 瓦片下载与拼接工具 (wxPython)"
-CONFIG_FILE = "gui_config.json"
-PNG_HEADER = b"\x89PNG\r\n\x1a\n"
+APP_TITLE = "WMTS 瓦片下载与拼接工具"
 
 # ---------- 任务流程常量 ----------
-STEP_NAMES = ["配置参数", "下载瓦片", "拼接大图", "任务完成"]
+STEP_NAMES = ["配置参数", "下载瓦片", "拼接大图", "地理标签", "任务完成"]
 ST_PENDING, ST_RUNNING, ST_DONE, ST_FAILED = 0, 1, 2, 3
 ST_COLORS = {
     ST_PENDING: "#9e9e9e",
@@ -43,6 +52,9 @@ ST_COLORS = {
     ST_FAILED: "#e53935",
 }
 ST_TEXTS = {ST_PENDING: "待命", ST_RUNNING: "进行中", ST_DONE: "完成", ST_FAILED: "失败"}
+
+# 事件 stage → 流水线步骤索引
+STAGE_STEP = {STAGE_DOWNLOAD: 1, STAGE_MERGE: 2, STAGE_GEO: 3}
 
 
 def wx_color(hex_str):
@@ -55,8 +67,8 @@ def wx_color(hex_str):
 class FlowPanel(wx.Panel):
     def __init__(self, parent):
         super().__init__(parent, size=(-1, 104))
-        self.states = [ST_PENDING] * 4
-        self.step_percent = [0.0, 0.0, 0.0, 0.0]
+        self.states = [ST_PENDING] * len(STEP_NAMES)
+        self.step_percent = [0.0] * len(STEP_NAMES)
         self.overall = 0.0
         self.overall_text = "就绪"
         self.SetBackgroundStyle(wx.BG_STYLE_PAINT)
@@ -64,8 +76,8 @@ class FlowPanel(wx.Panel):
         self.SetBackgroundColour(wx.Colour("#fafafa"))
 
     def reset(self):
-        self.states = [ST_PENDING] * 4
-        self.step_percent = [0.0] * 4
+        self.states = [ST_PENDING] * len(STEP_NAMES)
+        self.step_percent = [0.0] * len(STEP_NAMES)
         self.overall = 0.0
         self.overall_text = "就绪"
         self.Refresh()
@@ -96,30 +108,25 @@ class FlowPanel(wx.Panel):
         step_w = w / n
         centers = [(int(step_w * i + step_w / 2), cy) for i in range(n)]
 
-        # 步骤之间的连接线
         for i in range(n - 1):
             x1, y1 = centers[i]
             x2, y2 = centers[i + 1]
-            # 当前步骤已完成时连线为绿色，否则灰色
             line_color = wx_color("#43a047") if self.states[i] == ST_DONE else wx_color("#d0d0d0")
             dc.SetPen(wx.Pen(line_color, 3))
             dc.DrawLine(x1 + radius + 2, y1, x2 - radius - 2, y2)
 
-        # 步骤圆点 + 文字
         for i, (cx, cy_) in enumerate(centers):
             color = wx_color(ST_COLORS[self.states[i]])
             dc.SetBrush(wx.Brush(color))
             dc.SetPen(wx.Pen("#ffffff", 2))
             dc.DrawCircle(cx, cy_, radius)
 
-            # 步骤名
             name_font = wx.Font(9, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD)
             dc.SetFont(name_font)
             dc.SetTextForeground(wx.Colour("#303030"))
             tw, th = dc.GetTextExtent(STEP_NAMES[i])
             dc.DrawText(STEP_NAMES[i], cx - tw // 2, cy_ + radius + 6)
 
-            # 状态文字
             if self.states[i] == ST_RUNNING:
                 st_text = f"{self.step_percent[i]:.0f}%"
             else:
@@ -129,7 +136,6 @@ class FlowPanel(wx.Panel):
             tw2, th2 = dc.GetTextExtent(st_text)
             dc.DrawText(st_text, cx - tw2 // 2, cy_ + radius + 22)
 
-        # 整体进度条
         bar_y = 76
         bar_h = 16
         bar_x = 8
@@ -151,12 +157,7 @@ class FlowPanel(wx.Panel):
 
 
 # ======================================================================
-#  范围总览网格（可视化每个瓦片的状态：已完成/失败/待处理）
-#
-#  渲染方式：用 numpy 把状态数组映射成 RGB 位图后一次性贴图，
-#  不再逐格画矩形，因此 5 万乃至百万级瓦片也能流畅刷新。
-#  缩小到一像素多格时先做「最大值池化」，失败点不会被绿色淹没。
-#  交互：滚轮缩放、拖拽平移、悬停查看坐标、点击预览。
+#  范围总览网格（numpy 位图渲染，支持缩放/平移/悬停/点击）
 # ======================================================================
 GRID_PENDING, GRID_OK, GRID_FAILED = 0, 1, 2
 GRID_PALETTE = np.array([
@@ -178,11 +179,10 @@ class TileGridPanel(wx.Panel):
         self.frame = frame
         self._range = None                       # (matrix, cs, ce, rs, re)
         self._status = None                      # (nrows, ncols) uint8
-        self._pooled = None                      # 池化缓存
+        self._pooled = None
         self._pooled_k = 1
         self._pool_dirty = True
 
-        # 视图（scale = 每个瓦片的屏幕像素数）
         self._scale = 1.0
         self._ox = 0.0
         self._oy = 0.0
@@ -243,10 +243,9 @@ class TileGridPanel(wx.Panel):
         if ncols <= 0 or nrows <= 0:
             return None
         arr = np.zeros((nrows, ncols), dtype=np.uint8)
-        out_dir = cfg.OUTPUT_DIR
+        out_dir = self.frame.config.output_dir
         if not os.path.isdir(out_dir):
             return arr
-        # 遍历缓存（兼容新旧结构），标记范围内的瓦片
         try:
             for m, col, row, _path in iter_tiles(out_dir):
                 if m == matrix and cs <= col <= ce and rs <= row <= re:
@@ -336,7 +335,6 @@ class TileGridPanel(wx.Panel):
         aw, ah = self._area_size()
         if ncols <= 0 or nrows <= 0 or self._status is None:
             return None
-        # 一像素覆盖多个瓦片时先池化，保留失败点可见性
         k = 1
         if self._scale < 1.0:
             k = min(self.MAX_POOL, max(1, int(np.ceil(1.0 / self._scale))))
@@ -410,7 +408,6 @@ class TileGridPanel(wx.Panel):
         self._draw_overlay(dc, w, h)
 
     def _draw_overlay(self, dc, w, h):
-        # 悬停高亮
         tip = None
         if self._hover and self._status is not None:
             ncols, nrows = self._dims()
@@ -553,7 +550,7 @@ class TileGridPanel(wx.Panel):
         if ncols > 0 and nrows > 0:
             fit = min(aw / ncols, ah / nrows)
             if self._scale <= fit * 1.02:
-                self._view_ready = False   # 处于适配状态，跟随窗口重新适配
+                self._view_ready = False
             else:
                 self._clamp_view()
         self._invalidate()
@@ -567,7 +564,6 @@ class PreviewPanel(wx.Panel):
         super().__init__(parent)
         self.frame = frame
         self._fetching = False
-        self._current_path = None
         self._auto_timer = None
         self._fetched_bytes = None  # 网络获取但尚未保存的原始字节
         self._unsaved = False
@@ -579,25 +575,22 @@ class PreviewPanel(wx.Panel):
         title.SetFont(wx.Font(12, wx.FONTFAMILY_DEFAULT, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_BOLD))
         outer.Add(title, 0, wx.ALL, 8)
 
-        # 坐标选择
         coords = wx.BoxSizer(wx.HORIZONTAL)
         coords.Add(wx.StaticText(self, label="级别"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 8)
-        self.matrix_spin = wx.SpinCtrl(self, min=0, max=30, initial=cfg.TILE_MATRIX)
+        self.matrix_spin = wx.SpinCtrl(self, min=0, max=30, initial=frame.config.tile_matrix)
         coords.Add(self.matrix_spin, 0, wx.LEFT, 4)
         coords.Add(wx.StaticText(self, label="列"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
-        self.col_spin = wx.SpinCtrl(self, min=0, max=2000000, initial=cfg.TILE_COL_START)
+        self.col_spin = wx.SpinCtrl(self, min=0, max=2000000, initial=frame.config.col_start)
         coords.Add(self.col_spin, 1, wx.LEFT, 4)
         coords.Add(wx.StaticText(self, label="行"), 0, wx.ALIGN_CENTER_VERTICAL | wx.LEFT, 12)
-        self.row_spin = wx.SpinCtrl(self, min=0, max=2000000, initial=cfg.TILE_ROW_START)
+        self.row_spin = wx.SpinCtrl(self, min=0, max=2000000, initial=frame.config.row_start)
         coords.Add(self.row_spin, 1, wx.LEFT | wx.RIGHT, 4)
         outer.Add(coords, 0, wx.EXPAND | wx.TOP, 4)
 
-        # 坐标变化 -> 自动加载预览（防抖）
         for _s in (self.matrix_spin, self.col_spin, self.row_spin):
             _s.Bind(wx.EVT_SPINCTRL, lambda e: self._schedule_auto())
             _s.Bind(wx.EVT_TEXT, lambda e: self._schedule_auto())
 
-        # 操作按钮（预览自动加载，保存需手动点击）
         btns = wx.BoxSizer(wx.HORIZONTAL)
         self.save_btn = wx.Button(self, label="保存瓦片")
         self.clear_btn = wx.Button(self, label="清空")
@@ -613,12 +606,10 @@ class PreviewPanel(wx.Panel):
         hint.SetForegroundColour(wx.Colour("#888888"))
         outer.Add(hint, 0, wx.TOP, 6)
 
-        # 预览图像
         self.image_ctrl = wx.StaticBitmap(self, size=(self.PREVIEW_W, self.PREVIEW_H))
         self._set_placeholder("输入行列号后点击预览")
         outer.Add(self.image_ctrl, 0, wx.TOP, 8)
 
-        # 信息
         self.info_ctrl = wx.TextCtrl(self, style=wx.TE_MULTILINE | wx.TE_READONLY, size=(-1, 96))
         self.info_ctrl.SetFont(wx.Font(8, wx.FONTFAMILY_TELETYPE, wx.FONTSTYLE_NORMAL, wx.FONTWEIGHT_NORMAL))
         outer.Add(self.info_ctrl, 1, wx.EXPAND | wx.TOP, 8)
@@ -646,22 +637,23 @@ class PreviewPanel(wx.Panel):
             self._auto_timer.Stop()
 
     def reset_pending(self):
-        """开始一次新的网络获取前，清除上次未保存的内容"""
         self._fetched_bytes = None
         self._unsaved = False
         self.save_btn.Disable()
 
-    def show_fetched(self, content, matrix, col, row):
-        """显示网络获取的原始字节（写临时文件供 wx 解码，不保存到输出目录）"""
+    def show_content(self, content, matrix, col, row, source, can_save):
+        """显示瓦片字节（写临时文件供 wx 解码，不落盘到输出目录）"""
         import tempfile
         tmp_path = None
         try:
-            with tempfile.NamedTemporaryFile(prefix="wmts_preview_", suffix=".png", delete=False) as f:
+            with tempfile.NamedTemporaryFile(prefix="wmts_preview_", suffix=".png",
+                                             delete=False) as f:
                 f.write(content)
                 tmp_path = f.name
-            self._fetched_bytes = content
-            self._unsaved = True
-            self.show_image(tmp_path, "network")
+            self._fetched_bytes = content if can_save else None
+            self._unsaved = can_save
+            self.save_btn.Enable(can_save)
+            self.show_image(tmp_path, matrix, col, row, source)
         finally:
             if tmp_path:
                 try:
@@ -669,8 +661,46 @@ class PreviewPanel(wx.Panel):
                 except OSError:
                     pass
 
+    def show_image(self, path, matrix, col, row, source):
+        """在 UI 线程中显示本地图片文件"""
+        try:
+            img = wx.Image(path)
+            iw, ih = img.GetWidth(), img.GetHeight()
+            scale = min(self.PREVIEW_W / iw, self.PREVIEW_H / ih, 1.0)
+            nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
+            img = img.Scale(nw, nh, wx.IMAGE_QUALITY_HIGH)
+            bmp = wx.Bitmap(img)
+
+            canvas = wx.Bitmap(self.PREVIEW_W, self.PREVIEW_H)
+            mdc = wx.MemoryDC()
+            mdc.SelectObject(canvas)
+            mdc.SetBackground(wx.Brush(wx.Colour("#f0f0f0")))
+            mdc.Clear()
+            mdc.DrawBitmap(bmp, (self.PREVIEW_W - nw) // 2, (self.PREVIEW_H - nh) // 2)
+            mdc.SelectObject(wx.NullBitmap)
+            self.image_ctrl.SetBitmap(canvas)
+
+            size_kb = os.path.getsize(path) / 1024
+            if source == "local":
+                src_txt = "本地文件（已存在）"
+                loc_line = f"路径: {path}"
+            else:
+                target = tile_path(matrix, col, row, self.frame.config.output_dir)
+                src_txt = "网络获取（未保存）" if self._unsaved else "网络获取"
+                loc_line = f"保存位置: {target}（可点「保存瓦片」）"
+            self.info_ctrl.SetValue(
+                f"来源: {src_txt}\n"
+                f"坐标: 级别 {matrix} / 列 {col} / 行 {row}\n"
+                f"尺寸: {iw} × {ih} 像素\n"
+                f"大小: {size_kb:.1f} KB\n"
+                f"{loc_line}"
+            )
+            self.Layout()
+        except Exception as e:
+            self._set_placeholder("无法加载图片")
+            self.info_ctrl.SetValue(f"加载图片失败: {e}")
+
     def mark_saved(self, path):
-        """手动保存成功后的回调"""
         self._unsaved = False
         self._fetched_bytes = None
         self.save_btn.Disable()
@@ -695,56 +725,12 @@ class PreviewPanel(wx.Panel):
         self.image_ctrl.SetBitmap(bmp)
         self.Layout()
 
-    def show_image(self, path, source):
-        """在 UI 线程中显示本地图片文件"""
-        try:
-            img = wx.Image(path)
-            iw, ih = img.GetWidth(), img.GetHeight()
-            scale = min(self.PREVIEW_W / iw, self.PREVIEW_H / ih, 1.0)
-            nw, nh = max(1, int(iw * scale)), max(1, int(ih * scale))
-            img = img.Scale(nw, nh, wx.IMAGE_QUALITY_HIGH)
-            bmp = wx.Bitmap(img)
-
-            canvas = wx.Bitmap(self.PREVIEW_W, self.PREVIEW_H)
-            mdc = wx.MemoryDC()
-            mdc.SelectObject(canvas)
-            mdc.SetBackground(wx.Brush(wx.Colour("#f0f0f0")))
-            mdc.Clear()
-            mdc.DrawBitmap(bmp, (self.PREVIEW_W - nw) // 2, (self.PREVIEW_H - nh) // 2)
-            mdc.SelectObject(wx.NullBitmap)
-            self.image_ctrl.SetBitmap(canvas)
-
-            size_kb = os.path.getsize(path) / 1024
-            m, c, r = self.matrix_spin.GetValue(), self.col_spin.GetValue(), self.row_spin.GetValue()
-            if source == "local":
-                src_txt = "本地文件（已存在）"
-                loc_line = f"路径: {path}"
-                self.save_btn.Disable()
-            else:
-                target = tile_path(m, c, r, cfg.OUTPUT_DIR)
-                src_txt = "网络获取（未保存）" if self._unsaved else "网络获取"
-                loc_line = f"保存位置: {target}（未保存，可点「保存瓦片」）"
-                self.save_btn.Enable(self._unsaved)
-            self.info_ctrl.SetValue(
-                f"来源: {src_txt}\n"
-                f"坐标: 级别 {m} / 列 {c} / 行 {r}\n"
-                f"尺寸: {iw} × {ih} 像素\n"
-                f"大小: {size_kb:.1f} KB\n"
-                f"{loc_line}"
-            )
-            self._current_path = path
-            self.Layout()
-        except Exception as e:
-            self._set_placeholder("无法加载图片")
-            self.info_ctrl.SetValue(f"加载图片失败: {e}")
-
     def show_error(self, text):
         self._set_placeholder("加载失败")
         self.info_ctrl.SetValue(text)
         self.save_btn.Disable()
 
     def _clear(self):
-        self._current_path = None
         self._fetched_bytes = None
         self._unsaved = False
         self.save_btn.Disable()
@@ -807,47 +793,46 @@ class LogPanel(wx.Panel):
 
 
 # ======================================================================
-#  主窗口
+#  主窗口（薄客户端：只做渲染，业务全部在 wmts 包）
 # ======================================================================
 class WMTSFrame(wx.Frame):
     def __init__(self):
         super().__init__(None, title=APP_TITLE, size=(1180, 820))
         self.SetMinSize((960, 680))
+        self.tm = TaskManager(Config.load())
+        self.config = self.tm.config
         self._busy = False
-        self._pipeline = False
-        self._downloader = None
-        self._dl_start = 0.0
-        self._dl_stats = {}
-        self._fetch_seq = 0  # 网络预览请求序号，用于丢弃过期结果
+        self._task_type = None
+        self._fetch_seq = 0
 
         # ---------- 布局 ----------
         root = wx.BoxSizer(wx.VERTICAL)
 
-        # 顶部：任务流程
         self.flow = FlowPanel(self)
         root.Add(self.flow, 0, wx.EXPAND)
 
-        # 操作按钮条
         action_bar = wx.BoxSizer(wx.HORIZONTAL)
         self.pipeline_btn = wx.Button(self, label="▶ 一键执行全部")
         self.dl_btn = wx.Button(self, label="开始下载")
         self.merge_btn = wx.Button(self, label="开始拼接")
+        self.geo_btn = wx.Button(self, label="地理标签")
         self.stop_btn = wx.Button(self, label="停止")
         self.cache_btn = wx.Button(self, label="缓存管理")
-        self.pipeline_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_pipeline())
-        self.dl_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_download())
-        self.merge_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_merge())
+        self.pipeline_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_task("pipeline"))
+        self.dl_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_task("download"))
+        self.merge_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_task("merge"))
+        self.geo_btn.Bind(wx.EVT_BUTTON, lambda e: self.start_task("geo"))
         self.stop_btn.Bind(wx.EVT_BUTTON, lambda e: self.stop_current())
         self.cache_btn.Bind(wx.EVT_BUTTON, lambda e: self.open_cache_manager())
         self.stop_btn.Disable()
-        for b in (self.pipeline_btn, self.dl_btn, self.merge_btn, self.stop_btn, self.cache_btn):
+        for b in (self.pipeline_btn, self.dl_btn, self.merge_btn, self.geo_btn,
+                  self.stop_btn, self.cache_btn):
             action_bar.Add(b, 0, wx.RIGHT, 8)
         action_bar.AddStretchSpacer(1)
         self.range_hint = wx.StaticText(self, label="")
         action_bar.Add(self.range_hint, 0, wx.ALIGN_CENTER_VERTICAL)
         root.Add(action_bar, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.TOP, 8)
 
-        # 中间：左右分栏
         splitter = wx.SplitterWindow(self, style=wx.SP_LIVE_UPDATE)
         left_panel = wx.Panel(splitter)
         self.preview = PreviewPanel(splitter, self)
@@ -856,34 +841,140 @@ class WMTSFrame(wx.Frame):
         splitter.SetMinimumPaneSize(300)
         root.Add(splitter, 1, wx.EXPAND | wx.ALL, 8)
 
-        # 底部：日志
         self.log_panel = LogPanel(self, self)
         root.Add(self.log_panel, 0, wx.EXPAND | wx.LEFT | wx.RIGHT | wx.BOTTOM, 8)
         self.log_panel.SetMinSize((-1, 170))
 
         self.SetSizer(root)
 
-        # 状态栏
         self.status = self.CreateStatusBar(2)
         self.status.SetStatusText("就绪", 0)
         self.status.SetStatusText("", 1)
 
-        # 事件
         self.Bind(wx.EVT_CLOSE, self._on_close)
 
         # 初始化
-        self._load_config()
+        self._apply_config_to_ui()
         self._update_range_info()
-        self._sync_core_modules()
         self._refresh_all()
         self._log("欢迎使用 WMTS 瓦片下载与拼接工具")
-        self._log(f"下载范围: 级别 {cfg.TILE_MATRIX}, 列 {cfg.TILE_COL_START}-{cfg.TILE_COL_END}, "
-                  f"行 {cfg.TILE_ROW_START}-{cfg.TILE_ROW_END}, 共 {self._calc_total()} 片")
+        self._log(f"下载范围: 级别 {self.config.tile_matrix}, "
+                  f"列 {self.config.col_start}-{self.config.col_end}, "
+                  f"行 {self.config.row_start}-{self.config.row_end}, "
+                  f"共 {self.config.total} 片")
+        self._log(f"配置来源: {Config.__module__}（运行期保存于 config.json）")
 
-        # 后台扫描已下载瓦片
         threading.Thread(target=self._thread_scan, daemon=True).start()
-        # 启动后自动预览一次当前坐标的瓦片（本地优先）
+        self._start_event_reader()
         wx.CallLater(400, self.on_preview_auto)
+
+    # ================= 事件流（TaskManager → UI） =================
+    def _start_event_reader(self):
+        """后台线程消费事件队列，转投主线程处理。"""
+        sid, q = self.tm.events.subscribe()
+
+        def reader():
+            while True:
+                ev = q.get()
+                wx.CallAfter(self._on_event, ev)
+
+        threading.Thread(target=reader, daemon=True, name="wmts-event-reader").start()
+
+    def _on_event(self, ev):
+        t = ev.get("type")
+        if t == EV_LOG:
+            if ev.get("message"):
+                self._log(ev["message"])
+            return
+        if t == EV_PROGRESS:
+            self._on_progress(ev)
+        elif t == EV_STATE:
+            if ev.get("state") in ("failed", "cancelled"):
+                step = STAGE_STEP.get(ev.get("stage"))
+                self.flow.set_step(0, ST_DONE, 100)
+                if step is not None:
+                    self.flow.set_step(step, ST_FAILED)
+                self.flow.set_overall(0, ev.get("message") or ev["state"])
+        elif t == EV_DONE:
+            self._on_task_done(ev)
+        elif t == EV_ERROR:
+            if ev.get("message"):
+                self._log(f"错误: {ev['message']}")
+
+    def _on_progress(self, ev):
+        stage = ev.get("stage")
+        pct = ev.get("percent") or 0.0
+        if stage == STAGE_PIPELINE:
+            self.flow.set_overall(pct, f"总进度 {pct:.1f}%")
+            return
+        step = STAGE_STEP.get(stage)
+        if step is None:
+            return
+        self.flow.set_step(step, ST_RUNNING, pct)
+        if self._task_type == "pipeline":
+            self.flow.set_overall(self._pipeline_overall(stage, pct))
+        else:
+            self.flow.set_overall(pct)
+
+        if stage == STAGE_DOWNLOAD:
+            self.dl_progress.SetValue(int(pct * 10))
+            total, done = ev.get("total") or 0, ev.get("done") or 0
+            self.dl_percent.SetLabel(f"{pct:.1f}%  ({done}/{total})")
+            c = ev.get("counters") or {}
+            self.dl_stats.SetLabel(
+                f"总计 {total} | 成功 {c.get('success', 0)} | 失败 {c.get('fail', 0)} | "
+                f"跳过 {c.get('skip', 0)} | 无效 {c.get('invalid', 0)} | 重试 {c.get('retried', 0)}")
+            speed, eta = ev.get("speed"), ev.get("eta")
+            extra = ""
+            if speed:
+                extra += f" | 速度 {speed:.1f} 片/秒"
+            if eta:
+                extra += f" | 预计剩余 {eta:.0f}s"
+            self.status.SetStatusText(f"下载中 {pct:.1f}%{extra}", 0)
+            tile = ev.get("tile")
+            if tile and tile.get("result") in ("success", "skipped", "failed"):
+                self.grid.mark(tile["col"], tile["row"],
+                               "ok" if tile["result"] in ("success", "skipped") else "failed")
+        elif stage == STAGE_MERGE:
+            self.mg_progress.SetValue(int(pct * 10))
+            self.mg_stats.SetLabel(ev.get("message") or f"拼接中 {pct:.1f}%")
+            self.status.SetStatusText(f"拼接中 {pct:.1f}%", 0)
+
+    @staticmethod
+    def _pipeline_overall(stage, pct):
+        weights = {STAGE_DOWNLOAD: 50.0, STAGE_MERGE: 40.0, STAGE_GEO: 10.0}
+        acc = 0.0
+        for s, w in weights.items():
+            if s == stage:
+                return acc + w * pct / 100.0
+            acc += w
+        return acc
+
+    def _on_task_done(self, ev):
+        state = ev.get("state")
+        self._set_busy(False)
+        self._task_type = None
+        if state == "done":
+            self.flow.set_step(0, ST_DONE, 100)
+            self.flow.set_step(1, ST_DONE, 100)
+            self.flow.set_step(2, ST_DONE, 100)
+            self.flow.set_step(3, ST_DONE, 100)
+            self.flow.set_step(4, ST_DONE, 100)
+            self.flow.set_overall(100, "任务完成")
+            self.status.SetStatusText("任务完成", 0)
+            out = os.path.abspath(self.config.output_file)
+            if os.path.exists(out):
+                size_mb = os.path.getsize(out) / (1024 * 1024)
+                self.mg_stats.SetLabel(f"完成 | 输出 {out} | {size_mb:.2f} MB")
+                wx.MessageBox(f"任务完成！\n输出文件: {out}\n大小: {size_mb:.2f} MB",
+                              "完成", wx.OK | wx.ICON_INFORMATION)
+        elif state == "cancelled":
+            self.flow.set_overall(0, "任务已取消")
+            self.status.SetStatusText("任务已取消", 0)
+        else:
+            self.flow.set_overall(0, "任务失败")
+            self.status.SetStatusText("任务失败", 0)
+        self.grid.refresh_from_disk()
 
     # ================= 配置面板 =================
     def _build_config_tab(self, parent):
@@ -903,38 +994,39 @@ class WMTSFrame(wx.Frame):
         def ctl(row, col, c, span=1):
             grid.Add(c, (row, col), span=(1, span), flag=wx.EXPAND | wx.ALIGN_CENTER_VERTICAL)
 
-        self.url_ctrl = wx.TextCtrl(cfg_page, value=cfg.BASE_URL)
+        self.url_ctrl = wx.TextCtrl(cfg_page, value=self.config.base_url)
         lab(0, 0, "服务地址"); ctl(0, 1, self.url_ctrl, 5)
-        self.layer_ctrl = wx.TextCtrl(cfg_page, value=cfg.LAYER)
+        self.layer_ctrl = wx.TextCtrl(cfg_page, value=self.config.layer)
         lab(1, 0, "图层 Layer"); ctl(1, 1, self.layer_ctrl)
-        self.style_ctrl = wx.TextCtrl(cfg_page, value=cfg.STYLE)
+        self.style_ctrl = wx.TextCtrl(cfg_page, value=self.config.style)
         lab(1, 2, "样式"); ctl(1, 3, self.style_ctrl)
 
-        self.matrix_ctrl = wx.SpinCtrl(cfg_page, min=0, max=30, initial=cfg.TILE_MATRIX)
+        self.matrix_ctrl = wx.SpinCtrl(cfg_page, min=0, max=30, initial=self.config.tile_matrix)
         lab(2, 0, "缩放级别"); ctl(2, 1, self.matrix_ctrl)
-        self.col_start_ctrl = wx.SpinCtrl(cfg_page, min=0, max=2000000, initial=cfg.TILE_COL_START)
-        self.col_end_ctrl = wx.SpinCtrl(cfg_page, min=0, max=2000000, initial=cfg.TILE_COL_END)
+        self.col_start_ctrl = wx.SpinCtrl(cfg_page, min=0, max=2000000, initial=self.config.col_start)
+        self.col_end_ctrl = wx.SpinCtrl(cfg_page, min=0, max=2000000, initial=self.config.col_end)
         lab(2, 2, "列范围"); ctl(2, 3, self.col_start_ctrl)
         grid.Add(wx.StaticText(cfg_page, label="~"), (2, 4), flag=wx.ALIGN_CENTER_VERTICAL)
         ctl(2, 5, self.col_end_ctrl)
-        self.row_start_ctrl = wx.SpinCtrl(cfg_page, min=0, max=2000000, initial=cfg.TILE_ROW_START)
-        self.row_end_ctrl = wx.SpinCtrl(cfg_page, min=0, max=2000000, initial=cfg.TILE_ROW_END)
+        self.row_start_ctrl = wx.SpinCtrl(cfg_page, min=0, max=2000000, initial=self.config.row_start)
+        self.row_end_ctrl = wx.SpinCtrl(cfg_page, min=0, max=2000000, initial=self.config.row_end)
         lab(3, 0, "行范围"); ctl(3, 1, self.row_start_ctrl)
         grid.Add(wx.StaticText(cfg_page, label="~"), (3, 2), flag=wx.ALIGN_CENTER_VERTICAL)
         ctl(3, 3, self.row_end_ctrl)
 
-        self.out_dir_ctrl = wx.TextCtrl(cfg_page, value=cfg.OUTPUT_DIR)
+        self.out_dir_ctrl = wx.TextCtrl(cfg_page, value=self.config.output_dir)
         lab(4, 0, "保存目录"); ctl(4, 1, self.out_dir_ctrl, 3)
-        browse_btn = wx.Button(cfg_page, label="浏览…")
-        browse_btn.Bind(wx.EVT_BUTTON, lambda e: self._browse_dir())
-        grid.Add(browse_btn, (4, 4), span=(1, 2))
-        self.out_file_ctrl = wx.TextCtrl(cfg_page, value=cfg.OUTPUT_FILE)
+        self.out_file_ctrl = wx.TextCtrl(cfg_page, value=self.config.output_file)
         lab(5, 0, "输出文件"); ctl(5, 1, self.out_file_ctrl, 5)
 
-        self.workers_ctrl = wx.SpinCtrl(cfg_page, min=1, max=128, initial=cfg.MAX_WORKERS)
+        self.workers_ctrl = wx.SpinCtrl(cfg_page, min=1, max=128, initial=self.config.max_workers)
         lab(6, 0, "并发数"); ctl(6, 1, self.workers_ctrl)
-        self.timeout_ctrl = wx.SpinCtrl(cfg_page, min=1, max=120, initial=cfg.TIMEOUT)
+        self.timeout_ctrl = wx.SpinCtrl(cfg_page, min=1, max=120, initial=int(self.config.timeout))
         lab(6, 2, "超时(秒)"); ctl(6, 3, self.timeout_ctrl)
+
+        self.auto_geo_cb = wx.CheckBox(cfg_page, label="拼接后自动附加地理标签")
+        self.auto_geo_cb.SetValue(self.config.auto_geo)
+        lab(7, 0, ""); ctl(7, 1, self.auto_geo_cb, 3)
 
         grid.AddGrowableCol(1, 1)
         grid.AddGrowableCol(3, 1)
@@ -956,7 +1048,6 @@ class WMTSFrame(wx.Frame):
         page_sizer.Add(btn_row, 0, wx.TOP, 10)
         cfg_page.SetSizer(page_sizer)
 
-        # 绑定范围变化事件
         for c in (self.matrix_ctrl, self.col_start_ctrl, self.col_end_ctrl,
                   self.row_start_ctrl, self.row_end_ctrl):
             c.Bind(wx.EVT_SPINCTRL, lambda e: self._update_range_info())
@@ -974,11 +1065,13 @@ class WMTSFrame(wx.Frame):
         self.dl_stats = wx.StaticText(dl_page, label="总计 0 | 成功 0 | 失败 0 | 跳过 0 | 无效 0 | 重试 0")
         dl_sizer.Add(self.dl_stats, 0, wx.TOP, 4)
 
-        dl_sizer.Add(wx.StaticText(dl_page, label="范围总览 (滚轮缩放 / 拖拽平移 / 点击格子可预览):"), 0, wx.TOP | wx.BOTTOM, 8)
+        dl_sizer.Add(wx.StaticText(dl_page, label="范围总览 (滚轮缩放 / 拖拽平移 / 点击格子可预览):"),
+                     0, wx.TOP | wx.BOTTOM, 8)
         self.grid = TileGridPanel(dl_page, self)
         dl_sizer.Add(self.grid, 1, wx.EXPAND)
 
-        dl_sizer.Add(wx.StaticText(dl_page, label="说明: 绿色=已下载, 红色=失败, 灰色=待处理"), 0, wx.TOP, 4)
+        dl_sizer.Add(wx.StaticText(dl_page, label="说明: 绿色=已下载, 红色=失败, 灰色=待处理"),
+                     0, wx.TOP, 4)
         dl_page.SetSizer(dl_sizer)
 
         # ---- 拼接页 ----
@@ -1004,95 +1097,64 @@ class WMTSFrame(wx.Frame):
         mg_page.SetSizer(mg_sizer)
 
     # ================= 配置读写 =================
-    def _browse_dir(self):
-        with wx.DirDialog(self, "选择保存目录", defaultPath=self.out_dir_ctrl.GetValue()) as dlg:
-            if dlg.ShowModal() == wx.ID_OK:
-                self.out_dir_ctrl.SetValue(dlg.GetPath())
-
-    def _read_ui(self):
-        """从 UI 读取配置"""
-        return {
-            "base_url": self.url_ctrl.GetValue().strip(),
-            "layer": self.layer_ctrl.GetValue().strip(),
-            "style": self.style_ctrl.GetValue().strip(),
-            "tile_matrix": self.matrix_ctrl.GetValue(),
-            "col_start": self.col_start_ctrl.GetValue(),
-            "col_end": self.col_end_ctrl.GetValue(),
-            "row_start": self.row_start_ctrl.GetValue(),
-            "row_end": self.row_end_ctrl.GetValue(),
-            "output_dir": self.out_dir_ctrl.GetValue().strip(),
-            "output_file": self.out_file_ctrl.GetValue().strip(),
-            "max_workers": self.workers_ctrl.GetValue(),
-            "timeout": self.timeout_ctrl.GetValue(),
-        }
-
-    def _apply_ui(self, d):
-        self.url_ctrl.SetValue(d["base_url"])
-        self.layer_ctrl.SetValue(d["layer"])
-        self.style_ctrl.SetValue(d["style"])
-        self.matrix_ctrl.SetValue(d["tile_matrix"])
-        self.col_start_ctrl.SetValue(d["col_start"])
-        self.col_end_ctrl.SetValue(d["col_end"])
-        self.row_start_ctrl.SetValue(d["row_start"])
-        self.row_end_ctrl.SetValue(d["row_end"])
-        self.out_dir_ctrl.SetValue(d["output_dir"])
-        self.out_file_ctrl.SetValue(d["output_file"])
-        self.workers_ctrl.SetValue(d["max_workers"])
-        self.timeout_ctrl.SetValue(d["timeout"])
+    def _apply_config_to_ui(self):
+        cfg = self.config
+        self.url_ctrl.SetValue(cfg.base_url)
+        self.layer_ctrl.SetValue(cfg.layer)
+        self.style_ctrl.SetValue(cfg.style)
+        self.matrix_ctrl.SetValue(cfg.tile_matrix)
+        self.col_start_ctrl.SetValue(cfg.col_start)
+        self.col_end_ctrl.SetValue(cfg.col_end)
+        self.row_start_ctrl.SetValue(cfg.row_start)
+        self.row_end_ctrl.SetValue(cfg.row_end)
+        self.out_dir_ctrl.SetValue(cfg.output_dir)
+        self.out_file_ctrl.SetValue(cfg.output_file)
+        self.workers_ctrl.SetValue(cfg.max_workers)
+        self.timeout_ctrl.SetValue(int(cfg.timeout))
+        self.auto_geo_cb.SetValue(cfg.auto_geo)
         self._update_range_info()
+
+    def _sync_ui_to_config(self):
+        """把 UI 值写回 Config 对象（TaskManager 与本窗口共用同一对象）。"""
+        cfg = self.config
+        cfg.base_url = self.url_ctrl.GetValue().strip()
+        cfg.layer = self.layer_ctrl.GetValue().strip()
+        cfg.style = self.style_ctrl.GetValue().strip()
+        cfg.tile_matrix = self.matrix_ctrl.GetValue()
+        cfg.col_start = self.col_start_ctrl.GetValue()
+        cfg.col_end = self.col_end_ctrl.GetValue()
+        cfg.row_start = self.row_start_ctrl.GetValue()
+        cfg.row_end = self.row_end_ctrl.GetValue()
+        cfg.output_dir = self.out_dir_ctrl.GetValue().strip()
+        cfg.output_file = self.out_file_ctrl.GetValue().strip()
+        cfg.max_workers = self.workers_ctrl.GetValue()
+        cfg.timeout = self.timeout_ctrl.GetValue()
+        cfg.auto_geo = self.auto_geo_cb.GetValue()
+        cfg.sanitize()
 
     def _save_config(self):
         try:
-            d = self._read_ui()
-            with open(CONFIG_FILE, "w", encoding="utf-8") as f:
-                json.dump(d, f, ensure_ascii=False, indent=2)
-            self._log(f"配置已保存到 {CONFIG_FILE}")
+            self._sync_ui_to_config()
+            path = self.config.save()
+            self._log(f"配置已保存到 {path}")
         except Exception as e:
             self._log(f"保存配置失败: {e}")
 
     def _load_config(self):
-        if not os.path.exists(CONFIG_FILE):
-            return
         try:
-            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
-                d = json.load(f)
-            for k in ("base_url", "layer", "style", "tile_matrix", "col_start", "col_end",
-                      "row_start", "row_end", "output_dir", "output_file", "max_workers", "timeout"):
-                if k in d:
-                    self._set_attr(k, d[k])
-            self._log(f"已加载配置 {CONFIG_FILE}")
+            self.config = Config.load()
+            self.tm.config = self.config
+            self._apply_config_to_ui()
+            self._refresh_all()
+            self._log("已重新加载配置")
         except Exception as e:
             self._log(f"加载配置失败: {e}")
 
-    def _set_attr(self, key, val):
-        """将保存的配置写入对应控件"""
-        map_ = {
-            "base_url": self.url_ctrl, "layer": self.layer_ctrl, "style": self.style_ctrl,
-            "tile_matrix": self.matrix_ctrl, "col_start": self.col_start_ctrl,
-            "col_end": self.col_end_ctrl, "row_start": self.row_start_ctrl,
-            "row_end": self.row_end_ctrl, "output_dir": self.out_dir_ctrl,
-            "output_file": self.out_file_ctrl, "max_workers": self.workers_ctrl,
-            "timeout": self.timeout_ctrl,
-        }
-        c = map_.get(key)
-        if c:
-            c.SetValue(int(val) if isinstance(c, wx.SpinCtrl) else str(val))
-
     def _reset_config(self):
-        d = {
-            "base_url": "https://geocloud.hubgs.com/api/igs/rest/ogc/WMTSServer",
-            "layer": cfg.LAYER, "style": "default",
-            "tile_matrix": 16, "col_start": 52792, "col_end": 52838,
-            "row_start": 10467, "row_end": 10497,
-            "output_dir": "tiles", "output_file": "merged_map.tif",
-            "max_workers": 16, "timeout": 10,
-        }
-        self._apply_ui(d)
-        self._log("已恢复默认配置")
-
-    def _calc_total(self):
-        return (self.col_end_ctrl.GetValue() - self.col_start_ctrl.GetValue() + 1) * (
-            self.row_end_ctrl.GetValue() - self.row_start_ctrl.GetValue() + 1)
+        self.config = Config.defaults()
+        self.tm.config = self.config
+        self._apply_config_to_ui()
+        self._log("已恢复默认配置（记得保存才会写入 config.json）")
 
     def _update_range_info(self):
         try:
@@ -1100,85 +1162,47 @@ class WMTSFrame(wx.Frame):
             rows = self.row_end_ctrl.GetValue() - self.row_start_ctrl.GetValue() + 1
             total = cols * rows
             if total > 0:
-                self.range_hint.SetLabel(f"共 {cols} 列 × {rows} 行 = {total:,} 片 (级别 {self.matrix_ctrl.GetValue()})")
+                self.range_hint.SetLabel(
+                    f"共 {cols} 列 × {rows} 行 = {total:,} 片 (级别 {self.matrix_ctrl.GetValue()})")
             else:
                 self.range_hint.SetLabel("范围无效")
         except Exception:
             self.range_hint.SetLabel("范围无效")
 
-    def _sync_core_modules(self):
-        """将 UI 配置写入 config 模块，并同步到 download_tiles 的全局变量"""
-        d = self._read_ui()
-        cfg.BASE_URL = d["base_url"]
-        cfg.LAYER = d["layer"]
-        cfg.STYLE = d["style"]
-        cfg.TILE_MATRIX = d["tile_matrix"]
-        cfg.TILE_COL_START = d["col_start"]
-        cfg.TILE_COL_END = d["col_end"]
-        cfg.TILE_ROW_START = d["row_start"]
-        cfg.TILE_ROW_END = d["row_end"]
-        cfg.OUTPUT_DIR = d["output_dir"]
-        cfg.OUTPUT_FILE = d["output_file"]
-        cfg.MAX_WORKERS = d["max_workers"]
-        cfg.TIMEOUT = d["timeout"]
-
-        # 同步到下游模块（它们使用模块级全局变量）
-        dt_mod.OUTPUT_DIR = cfg.OUTPUT_DIR
-        dt_mod.MAX_WORKERS = cfg.MAX_WORKERS
-        dt_mod.TIMEOUT = cfg.TIMEOUT
-        dt_mod.HEADERS = cfg.HEADERS
-        dt_mod.get_tile_url = cfg.get_tile_url
-
     def _refresh_all(self):
-        self.grid.set_range(cfg.TILE_MATRIX, cfg.TILE_COL_START, cfg.TILE_COL_END,
-                            cfg.TILE_ROW_START, cfg.TILE_ROW_END)
+        self.grid.set_range(self.config.tile_matrix, self.config.col_start,
+                            self.config.col_end, self.config.row_start, self.config.row_end)
         self.grid.refresh_from_disk()
 
     # ================= 流程控制 =================
     def _set_busy(self, busy):
         self._busy = busy
-        for b in (self.pipeline_btn, self.dl_btn, self.merge_btn):
+        for b in (self.pipeline_btn, self.dl_btn, self.merge_btn, self.geo_btn):
             b.Enable(not busy)
         self.stop_btn.Enable(busy)
 
-    def _validate(self):
-        d = self._read_ui()
-        if d["col_end"] < d["col_start"] or d["row_end"] < d["row_start"]:
-            self._log("错误: 列/行范围不合法（结束值不能小于起始值）")
-            return False
-        if d["col_end"] - d["col_start"] + 1 > 5000 or d["row_end"] - d["row_start"] + 1 > 5000:
-            self._log("错误: 下载范围过大（单边超过 5000）")
-            return False
-        return True
-
-    # ---- 下载 ----
-    def start_pipeline(self):
+    def start_task(self, task_type):
         if self._busy:
             return
-        if not self._validate():
-            return
-        self._sync_core_modules()
+        self._sync_ui_to_config()
+        if task_type in ("download", "pipeline", "retry_failed"):
+            errs = self.config.validate_download_range()
+            if errs:
+                self._log("错误: " + "；".join(errs))
+                return
         self._refresh_all()
-        self._pipeline = True
-        self._reset_flow_for("download")
-        self._set_busy(True)
-        self.status.SetStatusText("正在下载瓦片...")
-        self._log("开始一键执行: 下载 → 拼接")
-        threading.Thread(target=self._thread_download, daemon=True).start()
-
-    def start_download(self):
-        if self._busy:
+        try:
+            params = {}
+            if task_type == "merge":
+                params["format"] = "tif" if self.rust_fmt_radio.GetSelection() == 0 else "png"
+            task = self.tm.start(task_type, params)
+        except (TaskBusyError, TaskError) as e:
+            self._log(f"无法启动任务: {e}")
             return
-        if not self._validate():
-            return
-        self._sync_core_modules()
-        self._refresh_all()
-        self._pipeline = False
-        self._reset_flow_for("download")
+        self._task_type = task_type
+        self._reset_flow_for(task_type)
         self._set_busy(True)
-        self.status.SetStatusText("正在下载瓦片...")
-        self._log("开始下载瓦片")
-        threading.Thread(target=self._thread_download, daemon=True).start()
+        self.status.SetStatusText(f"任务 {task.id} 运行中", 0)
 
     def _reset_flow_for(self, op):
         self.flow.reset()
@@ -1188,307 +1212,57 @@ class WMTSFrame(wx.Frame):
         elif op == "merge":
             self.flow.set_step(1, ST_DONE, 100)
             self.flow.set_step(2, ST_RUNNING, 0)
+        elif op == "geo":
+            self.flow.set_step(1, ST_DONE, 100)
+            self.flow.set_step(2, ST_DONE, 100)
+            self.flow.set_step(3, ST_RUNNING, 0)
+        elif op == "pipeline":
+            self.flow.set_step(1, ST_RUNNING, 0)
         self.flow.set_overall(0, "准备中...")
 
-    def _thread_download(self):
-        out_dir = cfg.OUTPUT_DIR
-        nworkers = cfg.MAX_WORKERS
-        matrix = cfg.TILE_MATRIX
-        cs, ce, rs, re = cfg.TILE_COL_START, cfg.TILE_COL_END, cfg.TILE_ROW_START, cfg.TILE_ROW_END
-        self._dl_start = time.time()
-
-        downloader = dt_mod.AsyncTileDownloader(
-            output_dir=out_dir,
-            max_workers=nworkers,
-            progress_callback=lambda info: wx.CallAfter(self._on_dl_progress, info),
-        )
-        self._downloader = downloader
-        try:
-            asyncio_run(downloader.download_batch(matrix, cs, ce, rs, re))
-            ok = not downloader.cancel_event.is_set()
-        except Exception as e:
-            ok = False
-            wx.CallAfter(self._log, f"下载发生异常: {e}")
-        finally:
-            self._downloader = None
-            wx.CallAfter(self._on_dl_done, ok)
-
-    def _on_dl_progress(self, info):
-        total = info["total"]
-        done = info["done"]
-        pct = (done / total * 100) if total else 0
-        self.dl_progress.SetValue(int(pct * 10))
-        self.dl_percent.SetLabel(f"{pct:.1f}%  ({done}/{total})")
-        self.dl_stats.SetLabel(
-            f"总计 {total} | 成功 {info['success']} | 失败 {info['fail']} | "
-            f"跳过 {info['skip']} | 无效 {info['invalid']} | 重试 {info['retried']}"
-        )
-        elapsed = time.time() - self._dl_start
-        speed = done / elapsed if elapsed > 0 else 0
-        eta = (total - done) / speed if speed > 0 else 0
-        extra = f" | 速度 {speed:.1f} 片/秒 | 预计剩余 {eta:.0f}s" if speed > 0 else ""
-        self.status.SetStatusText(f"下载中 {pct:.1f}%{extra}")
-        self.flow.set_step(1, ST_RUNNING, pct)
-        if self._pipeline:
-            self.flow.set_overall(pct * 0.5, f"下载瓦片 {pct:.1f}%")
-        else:
-            self.flow.set_overall(pct, f"下载瓦片 {pct:.1f}%")
-        # 实时更新网格
-        if info.get("last_result") == "success" or info.get("last_result") == "skipped":
-            self.grid.mark(info["last_col"], info["last_row"], "ok")
-        elif info.get("last_result") == "failed":
-            self.grid.mark(info["last_col"], info["last_row"], "failed")
-        # 失败时记录日志（降低频率）
-        if info["fail"] and info["done"] % 20 == 0:
-            self._log(f"进度 {pct:.1f}%: 成功 {info['success']}, 失败 {info['fail']}, 跳过 {info['skip']}")
-        self._dl_stats = info
-
-    def _on_dl_done(self, ok):
-        info = self._dl_stats or {}
-        self.grid.refresh_from_disk()
-        if not ok:
-            self.flow.set_step(1, ST_FAILED)
-            self.flow.set_step(2, ST_PENDING)
-            self.flow.set_step(3, ST_PENDING)
-            self.flow.set_overall(0, "下载已取消")
-            self._set_busy(False)
-            self.status.SetStatusText("下载已取消")
-            self._log(f"下载已取消 (已下载 {info.get('success', 0)} 片)")
-            self._pipeline = False
-            return
-
-        self.flow.set_step(1, ST_DONE, 100)
-        self.status.SetStatusText("下载完成")
-        self._log(f"下载完成: 成功 {info.get('success', 0)}, 失败 {info.get('fail', 0)}, "
-                  f"跳过 {info.get('skip', 0)}, 无效 {info.get('invalid', 0)}, 重试 {info.get('retried', 0)}")
-
-        if self._pipeline:
-            self._log("开始拼接大图...")
-            self.flow.set_step(2, ST_RUNNING, 0)
-            self.flow.set_overall(50, "开始拼接...")
-            # 主线程缓存控件取值，供拼接工作线程使用（wx 控件不能在子线程访问）
-            self._merge_params = self._capture_merge_params()
-            threading.Thread(target=self._thread_merge, daemon=True).start()
-        else:
-            self._set_busy(False)
-            self._pipeline = False
-
-    # ---- 拼接 ----
-    def start_merge(self):
-        if self._busy:
-            return
-        self._sync_core_modules()
-        self._refresh_all()
-        self._pipeline = False
-        self._reset_flow_for("merge")
-        # 在主线程缓存控件取值，供工作线程使用（wx 控件不能在子线程访问）
-        self._merge_params = self._capture_merge_params()
-        self._set_busy(True)
-        self.status.SetStatusText("正在拼接大图...")
-        self._log("开始拼接大图")
-        threading.Thread(target=self._thread_merge, daemon=True).start()
-
-    def _capture_merge_params(self):
-        return {
-            "use_rust": True,
-            "rust_fmt": self.rust_fmt_radio.GetSelection(),  # 0=BigTIFF 1=PNG
-        }
-
-    def _thread_merge(self):
-        params = getattr(self, "_merge_params", None)
-        if params is None:
-            wx.CallAfter(self._log, "警告: 拼接参数未缓存，使用默认参数(BigTIFF)")
-            params = {"use_rust": True, "rust_fmt": 0}
-        self._thread_merge_rust(params)
-
-    def _thread_merge_rust(self, params):
-        """调用 Rust 引擎（merge_rs）执行合并，解析 JSON 进度"""
-        fmt = "tif" if params.get("rust_fmt", 0) == 0 else "png"
-        if fmt == "tif":
-            out = str(Path(cfg.OUTPUT_FILE).with_suffix(".tif"))
-        else:
-            out = cfg.OUTPUT_FILE
-        bin_path = Path(__file__).resolve().parent / "merge_rs" / "target" / "release" / "merge_rs"
-        if not bin_path.exists():
-            wx.CallAfter(self._log, f"未找到 Rust 引擎: {bin_path}\n请先执行: cd merge_rs && cargo build --release")
-            wx.CallAfter(self._on_merge_done, False)
-            return
-        cmd = [
-            str(bin_path),
-            "--tiles-dir", cfg.OUTPUT_DIR,
-            "--matrix", str(cfg.TILE_MATRIX),
-            "--col-start", str(cfg.TILE_COL_START), "--col-end", str(cfg.TILE_COL_END),
-            "--row-start", str(cfg.TILE_ROW_START), "--row-end", str(cfg.TILE_ROW_END),
-            "--out", out, "--format", fmt, "--progress-json",
-        ]
-        self._merge_start = time.time()
-        wx.CallAfter(self._log, "运行 Rust 引擎: " + " ".join(cmd))
-        self._merge_proc = None
-        try:
-            proc = subprocess.Popen(cmd, stderr=subprocess.PIPE, text=True, bufsize=1)
-            self._merge_proc = proc
-            for line in proc.stderr:
-                line = line.strip()
-                if not line.startswith("{"):
-                    continue
-                try:
-                    info = json.loads(line)
-                except Exception:
-                    continue
-                if info.get("done"):
-                    wx.CallAfter(self._on_merge_progress, {
-                        "stage": "save", "percent": 100,
-                        "message": f"写出完成 | 峰值内存 {info.get('peak_mb', 0):.0f} MB"
-                    })
-                    continue
-                wx.CallAfter(self._on_merge_progress, {
-                    "stage": "merge",
-                    "percent": info.get("percent", 0),
-                    "loaded": info.get("tiles", 0),
-                    "missing": 0,
-                })
-            rc = proc.wait()
-            self._merge_proc = None
-            ok = (rc == 0) and os.path.exists(out)
-            if not ok:
-                wx.CallAfter(self._log, f"Rust 引擎退出码 {rc}")
-            else:
-                cfg.OUTPUT_FILE = out  # 让完成弹窗显示实际输出文件
-            wx.CallAfter(self._on_merge_done, ok)
-        except Exception as e:
-            self._merge_proc = None
-            wx.CallAfter(self._log, f"Rust 引擎运行异常: {e}")
-            wx.CallAfter(self._on_merge_done, False)
-
-    def _on_merge_progress(self, info):
-        stage = info.get("stage", "")
-        pct = info.get("percent", 0)
-        self.mg_progress.SetValue(int(pct * 10))
-        if stage == "scan":
-            self.mg_stats.SetLabel(info.get("message", "扫描瓦片目录..."))
-        elif stage == "merge":
-            self.mg_stats.SetLabel(
-                f"拼接中 {pct:.1f}% | 已拼接 {info.get('loaded', 0)} 片 | 缺失 {info.get('missing', 0)} 片"
-            )
-        elif stage == "save":
-            self.mg_stats.SetLabel(info.get("message", "保存大图中..."))
-        self.flow.set_step(2, ST_RUNNING, pct)
-        if self._pipeline:
-            self.flow.set_overall(50 + pct * 0.5, f"拼接大图 {pct:.1f}%")
-        else:
-            self.flow.set_overall(pct, f"拼接大图 {pct:.1f}%")
-        self.status.SetStatusText(f"拼接中 {pct:.1f}%")
-
-    def _on_merge_done(self, ok):
-        self._set_busy(False)
-        if ok:
-            self.flow.set_step(2, ST_DONE, 100)
-            self.flow.set_step(3, ST_DONE, 100)
-            self.flow.set_overall(100, "任务完成")
-            self.status.SetStatusText("任务完成")
-            self._log("拼接完成，全部任务结束")
-            if not self._pipeline:
-                pass
-            out = os.path.abspath(cfg.OUTPUT_FILE)
-            if os.path.exists(out):
-                size_mb = os.path.getsize(out) / (1024 * 1024)
-                self.mg_stats.SetLabel(f"完成 | 输出 {out} | {size_mb:.2f} MB")
-                self._log(f"拼接成功: {out} ({size_mb:.2f} MB)")
-                wx.MessageBox(f"拼接完成！\n输出文件: {out}\n大小: {size_mb:.2f} MB", "完成",
-                              wx.OK | wx.ICON_INFORMATION)
-        else:
-            self.flow.set_step(2, ST_FAILED)
-            self.flow.set_step(3, ST_PENDING)
-            self.flow.set_overall(0, "拼接失败")
-            self.status.SetStatusText("拼接失败")
-            self.mg_stats.SetLabel("状态: 失败")
-            self._log("拼接失败")
-        self._pipeline = False
-
-    # ---- 停止 ----
     def stop_current(self):
-        if self._downloader is not None:
-            self._downloader.cancel_event.set()
-            self._log("已请求停止下载，正在取消剩余任务...")
-            self.status.SetStatusText("正在停止下载...")
-        elif getattr(self, "_merge_proc", None) is not None:
-            try:
-                self._merge_proc.terminate()
-            except Exception:
-                pass
-            self._log("已终止 Rust 合并进程")
-        else:
-            self._log("拼接过程不支持中断，请等待完成")
+        if self.tm.cancel():
+            self._log("已请求停止任务...")
+            self.status.SetStatusText("正在停止...", 0)
 
-    # ================= 瓦片预览（自动加载 / 手动保存） =================
+    # ================= 瓦片预览 =================
     def on_grid_click(self, col, row):
-        self.preview.set_coords(cfg.TILE_MATRIX, col, row)
-        self.on_preview_auto()
+        self.preview.set_coords(self.config.tile_matrix, col, row)
 
     def on_preview_auto(self):
         """坐标变化后的自动加载：本地已有则直接显示，缺失时自动联网（不保存）"""
-        if self._busy:
-            return
-        self._sync_core_modules()
-        m, c, r = self.preview._coords()
-        if find_tile(m, c, r, cfg.OUTPUT_DIR):
-            self.on_preview_local()
-        else:
-            self.on_preview_network()
-
-    def on_preview_local(self):
-        self._sync_core_modules()
-        m, c, r = self.preview._coords()
-        path = find_tile(m, c, r, cfg.OUTPUT_DIR)
-        if not path:
-            self.preview.show_error(f"本地未找到该瓦片:\n{tile_path(m, c, r, cfg.OUTPUT_DIR)}")
-            self._log(f"本地预览: [{c},{r}] 不存在")
-            return
-        try:
-            with open(path, "rb") as f:
-                if f.read(8) != PNG_HEADER:
-                    raise ValueError("文件不是有效 PNG")
-            self.preview.show_image(path, "local")
-            self._log(f"本地预览: [{c},{r}]")
-        except Exception as e:
-            self.preview.show_error(f"无法加载瓦片 [{c},{r}]: {e}")
-            self._log(f"本地预览失败 [{c},{r}]: {e}")
-
-    def on_preview_network(self):
-        """从网络获取当前坐标的瓦片（仅预览，不自动保存）"""
-        if self._busy:
-            self.preview.show_error("任务运行中，暂不联网预览")
-            return
-        self._sync_core_modules()
-        m, c, r = self.preview._coords()
         self._fetch_seq += 1
         self.preview.reset_pending()
+        m, c, r = self.preview._coords()
         self.preview.set_fetching(True)
-        self.preview.info_ctrl.SetValue(f"正在从网络获取 [{c},{r}] ...")
-        threading.Thread(target=self._thread_fetch_tile, args=(m, c, r, self._fetch_seq), daemon=True).start()
+        self.preview.info_ctrl.SetValue(f"正在加载 [{c},{r}] ...")
+        threading.Thread(target=self._thread_preview,
+                         args=(m, c, r, "auto", self._fetch_seq),
+                         daemon=True).start()
 
-    def _thread_fetch_tile(self, m, c, r, seq):
-        url = cfg.get_tile_url(m, c, r)
+    def _thread_preview(self, m, c, r, source, seq):
         try:
-            resp = httpx.get(url, headers=cfg.HEADERS, timeout=15)
-            resp.raise_for_status()
-            if not resp.content.startswith(PNG_HEADER):
-                raise ValueError("响应内容不是有效 PNG 图片")
-
-            def apply():
-                # 丢弃过期结果：已发起新请求或坐标已变化
-                if seq != self._fetch_seq:
-                    return
-                if self.preview._coords() != (m, c, r):
-                    return
-                self.preview.show_fetched(resp.content, m, c, r)
-                self._log(f"网络预览 [{c},{r}] 完成 ({len(resp.content) / 1024:.1f} KB, 未保存)")
-            wx.CallAfter(apply)
+            content, used = core_preview.get_tile(self.config, m, c, r, source=source)
         except Exception as e:
-            wx.CallAfter(self._log, f"网络预览失败 [{c},{r}]: {e}")
-            wx.CallAfter(self.preview.show_error, f"网络获取失败 [{c},{r}]:\n{e}")
-        finally:
+            wx.CallAfter(self._log, f"预览失败 [{c},{r}]: {e}")
+            wx.CallAfter(self.preview.show_error, f"获取失败 [{c},{r}]:\n{e}")
             wx.CallAfter(self.preview.set_fetching, False)
+            return
+
+        def apply():
+            if seq != self._fetch_seq:
+                return  # 丢弃过期结果
+            if self.preview._coords() != (m, c, r):
+                return
+            self.preview.show_content(
+                content, m, c, r,
+                source="local" if used == "local" else "network",
+                can_save=(used != "local"))
+            self._log(f"预览 [{c},{r}] ({'本地' if used == 'local' else '网络'}, "
+                      f"{len(content) / 1024:.1f} KB)")
+            self.preview.set_fetching(False)
+
+        wx.CallAfter(apply)
 
     def on_save_tile(self):
         """手动保存当前预览的瓦片到输出目录"""
@@ -1497,13 +1271,9 @@ class WMTSFrame(wx.Frame):
             self._log("没有可保存的预览内容")
             return
         m, c, r = self.preview._coords()
-        out_dir = cfg.OUTPUT_DIR
-        path = tile_path(m, c, r, out_dir)
         try:
-            ensure_tile_dir(m, r, out_dir)
-            with open(path, "wb") as f:
-                f.write(content)
-            self.preview.mark_saved(path)
+            path = core_preview.save_tile(self.config, m, c, r, content)
+            self.preview.mark_saved(str(path))
             self.grid.mark(c, r, "ok")
             self._log(f"瓦片已手动保存 [{c},{r}] -> {path}")
         except Exception as e:
@@ -1512,14 +1282,12 @@ class WMTSFrame(wx.Frame):
 
     # ================= 缓存管理 =================
     def open_cache_manager(self):
-        """打开缓存管理对话框"""
         if self._busy:
             self._log("任务运行中，请稍后再管理缓存")
             return
-        CacheManageDialog(self, cfg.OUTPUT_DIR).Show()
+        CacheManageDialog(self, self.config).Show()
 
     def _thread_cache_op(self, dlg, op, *args):
-        """后台执行缓存操作，避免阻塞界面"""
         def work():
             try:
                 result = op(*args)
@@ -1540,27 +1308,22 @@ class WMTSFrame(wx.Frame):
 
     def _on_close(self, evt):
         self.preview.cancel_auto()
-        if self._busy and self._downloader is not None:
+        if self._busy:
             if wx.MessageBox("任务正在进行，确定要退出吗？", "确认退出",
                              wx.YES_NO | wx.ICON_QUESTION) != wx.YES:
                 evt.Veto()
                 return
-            self._downloader.cancel_event.set()
+            self.tm.cancel()
         self.Destroy()
 
 
-def asyncio_run(coro):
-    """在任意线程中运行 asyncio 协程"""
-    import asyncio
-    asyncio.run(coro)
-
-
 class CacheManageDialog(wx.Dialog):
-    """缓存管理对话框：统计 + 清理 + 迁移"""
+    """缓存管理对话框：统计 + 清理 + 迁移（业务来自 wmts.core.cache）"""
 
-    def __init__(self, parent, base_dir):
+    def __init__(self, parent, config):
         super().__init__(parent, title="瓦片缓存管理", size=(600, 480))
-        self.base = base_dir
+        self.config = config
+        self.base = str(config.resolve_path(config.output_dir))
         self._busy = False
 
         panel = wx.Panel(self)
@@ -1571,10 +1334,9 @@ class CacheManageDialog(wx.Dialog):
         )
         sizer.Add(self.stats_txt, 1, wx.EXPAND | wx.ALL, 8)
 
-        # 清理条件
         cond = wx.BoxSizer(wx.HORIZONTAL)
         cond.Add(wx.StaticText(panel, label="级别:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
-        self.matrix_ctrl = wx.SpinCtrl(panel, min=0, max=30, initial=cfg.TILE_MATRIX)
+        self.matrix_ctrl = wx.SpinCtrl(panel, min=0, max=30, initial=config.tile_matrix)
         cond.Add(self.matrix_ctrl, 0, wx.RIGHT, 14)
         cond.Add(wx.StaticText(panel, label="N 天前:"), 0, wx.ALIGN_CENTER_VERTICAL | wx.RIGHT, 4)
         self.days_ctrl = wx.SpinCtrl(panel, min=1, max=3650, initial=30)
@@ -1584,7 +1346,6 @@ class CacheManageDialog(wx.Dialog):
         cond.Add(self.maxsize_ctrl, 0)
         sizer.Add(cond, 0, wx.LEFT | wx.RIGHT | wx.TOP, 8)
 
-        # 按钮
         btns = wx.BoxSizer(wx.HORIZONTAL)
         self._mk_btn(btns, panel, "刷新统计", self._on_refresh)
         self._mk_btn(btns, panel, "清理该级别", self._on_prune_matrix)
@@ -1610,20 +1371,24 @@ class CacheManageDialog(wx.Dialog):
         self._busy = busy
         self.result_txt.SetLabel(msg)
 
-    # ---------- 统计 ----------
     def refresh_stats(self):
-        import io
-        buf = io.StringIO()
-        old = sys.stdout
-        sys.stdout = buf
-        try:
-            tile_cache.print_stats(self.base)
-        finally:
-            sys.stdout = old
-        self.stats_txt.SetValue(buf.getvalue())
+        total, size, per = core_cache.cache_stats(self.base)
+
+        def fmt_mb(n):
+            return f"{n / (1024 * 1024):.1f} MB"
+
+        lines = [f"缓存目录: {self.base}",
+                 f"总瓦片数: {total} | 总大小: {fmt_mb(size)}", "-" * 64,
+                 f"{'级别':<6}{'瓦片数':>10}{'大小':>12}{'列范围':>18}{'行范围':>18}"]
+        for m in sorted(per):
+            v = per[m]
+            col_rng = f"{v['min_col']}-{v['max_col']}" if v["min_col"] is not None else "-"
+            row_rng = f"{v['min_row']}-{v['max_row']}" if v["min_row"] is not None else "-"
+            lines.append(f"{m:<6}{v['tiles']:>10}{fmt_mb(v['size']):>12}"
+                         f"{col_rng:>18}{row_rng:>18}")
+        self.stats_txt.SetValue("\n".join(lines))
 
     def on_op_done(self, err, result):
-        """后台操作完成回调（主线程）"""
         self._set_busy(False)
         if err:
             self.result_txt.SetLabel(f"操作失败: {err}")
@@ -1635,16 +1400,10 @@ class CacheManageDialog(wx.Dialog):
             moved, left = result
             extra = f"，目标已存在跳过 {left} 个" if left else ""
             self.result_txt.SetLabel(f"完成：迁移 {moved} 个瓦片{extra}")
-        elif kind == "clear":
-            removed, freed = result
-            self.result_txt.SetLabel(
-                f"完成：清空 {removed} 项，释放 {freed / (1024 * 1024):.1f} MB"
-            )
         else:
             removed, freed = result
             self.result_txt.SetLabel(
-                f"完成：删除 {removed} 个瓦片，释放 {freed / (1024 * 1024):.1f} MB"
-            )
+                f"完成：处理 {removed} 项，释放 {freed / (1024 * 1024):.1f} MB")
         self.refresh_stats()
 
     def _run(self, op, kind, *args):
@@ -1662,7 +1421,6 @@ class CacheManageDialog(wx.Dialog):
             except Exception as e:
                 self.on_op_done(str(e), None)
 
-    # ---------- 操作 ----------
     def _on_refresh(self, _evt):
         self.refresh_stats()
 
@@ -1670,29 +1428,29 @@ class CacheManageDialog(wx.Dialog):
         m = self.matrix_ctrl.GetValue()
         if wx.MessageBox(f"删除级别 {m} 的全部瓦片？", "确认清理",
                          wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self._run(tile_cache.prune_matrix, "prune", m)
+            self._run(core_cache.prune_matrix, "prune", m)
 
     def _on_prune_old(self, _evt):
         days = self.days_ctrl.GetValue()
         if wx.MessageBox(f"删除 {days} 天前下载的所有瓦片？", "确认清理",
                          wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self._run(tile_cache.prune_older_than, "prune", days)
+            self._run(core_cache.prune_older_than, "prune", days)
 
     def _on_prune_size(self, _evt):
         mb = self.maxsize_ctrl.GetValue()
         if wx.MessageBox(f"按最旧优先删除，直到缓存 ≤ {mb} MB？", "确认清理",
                          wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self._run(tile_cache.prune_to_max_size, "prune", mb)
+            self._run(core_cache.prune_to_max_size, "prune", mb)
 
     def _on_migrate(self, _evt):
         if wx.MessageBox("把旧扁平结构瓦片迁移到分级目录？", "确认迁移",
                          wx.YES_NO | wx.ICON_QUESTION) == wx.YES:
-            self._run(tile_cache.migrate, "migrate")
+            self._run(core_cache.migrate, "migrate")
 
     def _on_clear(self, _evt):
         if wx.MessageBox("清空全部缓存瓦片？此操作不可恢复！", "确认清空",
                          wx.YES_NO | wx.ICON_WARNING) == wx.YES:
-            self._run(tile_cache.clear_cache, "clear")
+            self._run(core_cache.clear_cache, "clear")
 
 
 def main():

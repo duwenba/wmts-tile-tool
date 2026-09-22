@@ -130,10 +130,24 @@ if [ "$NO_CHECK" -eq 0 ]; then
     fi
 
     if [ "$SKIP_UV" -eq 0 ]; then
-        if uv run python -c "import wx, numpy, httpx, requests, tqdm, psutil, aiofiles; print('  Python 核心依赖 OK（wxPython', wx.__version__ + '）')" 2>/dev/null; then
+        if uv run python -c "import wx, numpy, httpx, tqdm, aiofiles, fastapi, uvicorn; print('  Python 核心依赖 OK（wxPython', wx.__version__ + '）')" 2>/dev/null; then
             :
         else
             warn "Python 依赖导入自检未通过"
+            FAILED=1
+        fi
+        # 核心层单元测试（不联网）
+        if uv run pytest -q >/dev/null 2>&1; then
+            ok "核心层单元测试通过（pytest）"
+        else
+            warn "单元测试未通过（可运行: uv run pytest 查看详情）"
+            FAILED=1
+        fi
+        # Web 服务可导入
+        if uv run python -c "from wmts.api import app; print('  Web 服务 OK（FastAPI 路由', len(app.routes), '条）')" 2>/dev/null; then
+            :
+        else
+            warn "Web 服务导入自检未通过"
             FAILED=1
         fi
     fi
@@ -146,10 +160,11 @@ ELAPSED=$(( $(date +%s) - START_TIME ))
 printf "\n%s"
 step "构建完成 ✔（耗时 ${ELAPSED}s）"
 printf "%s\n" "$C_GREEN"
+echo "  ▸ 启动 Web 服务:       uv run python -m wmts.server   （推荐，浏览器访问 http://127.0.0.1:8760）"
 echo "  ▸ 启动图形界面:        uv run python gui_main.py"
 echo "  ▸ 下载瓦片(HTTP/2):    uv run python download_tiles_async.py"
 echo "  ▸ 拼接大图(Rust 引擎): uv run python merge_rs_cli.py"
 echo "  ▸ 缓存管理:            uv run python tile_cache.py stats"
-echo "  ▸ 参数配置:            编辑 config.py（下载范围/数据源）"
-echo "  ▸ 首次使用前记得在 config.py 中配置目标 WMTS 服务参数"
+echo "  ▸ API 文档:            服务启动后访问 http://127.0.0.1:8760/docs"
+echo "  ▸ 参数配置:            编辑 config.py（默认值）；运行期配置在 config.json"
 printf "%s\n" "$C_RESET"

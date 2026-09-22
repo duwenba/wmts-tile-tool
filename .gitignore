@@ -23,7 +23,14 @@ gui_config*
 download_progress.json
 download_failed.txt
 
+# 运行期配置与图层元数据快照（Web/API 生成）
+config.json
+layer_meta/
+
 # Rust 构建产物
 merge_rs/target/
 merged_map.tif
 info.json
+
+# 下载进度归档备份
+download_progress.json.bak

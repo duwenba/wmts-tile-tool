@@ -155,12 +155,28 @@ if (-not $NoCheck) {
     }
 
     if (-not $SkipUv) {
-        $wxVer = & uv run python -c "import wx; print(wx.__version__)" 2>$null
+        $wxVer = & uv run python -c "import wx, numpy, httpx, tqdm, aiofiles, fastapi, uvicorn; print(wx.__version__)" 2>$null
         if ($LASTEXITCODE -eq 0 -and $wxVer) {
             Ok "Python 核心依赖 OK（wxPython $wxVer）"
         }
         else {
             Warn "Python 依赖导入自检未通过"
+            $Failed = $true
+        }
+        & uv run pytest -q 2>$null | Out-Null
+        if ($LASTEXITCODE -eq 0) {
+            Ok "核心层单元测试通过（pytest）"
+        }
+        else {
+            Warn "单元测试未通过（可运行: uv run pytest 查看详情）"
+            $Failed = $true
+        }
+        & uv run python -c "from wmts.api import app" 2>$null
+        if ($LASTEXITCODE -eq 0) {
+            Ok "Web 服务导入 OK（FastAPI）"
+        }
+        else {
+            Warn "Web 服务导入自检未通过"
             $Failed = $true
         }
     }
@@ -173,10 +189,11 @@ $Elapsed = [int]((Get-Date) - $StartTime).TotalSeconds
 Write-Host ""
 Write-Host "==> 构建完成 ✔（耗时 ${Elapsed}s）" -ForegroundColor White -BackgroundColor DarkBlue
 Write-Host ""
+Write-Host "  ▸ 启动 Web 服务:       uv run python -m wmts.server   （推荐，浏览器访问 http://127.0.0.1:8760）"
 Write-Host "  ▸ 启动图形界面:        uv run python gui_main.py"
 Write-Host "  ▸ 下载瓦片(HTTP/2):    uv run python download_tiles_async.py"
 Write-Host "  ▸ 拼接大图(Rust 引擎): uv run python merge_rs_cli.py"
 Write-Host "  ▸ 缓存管理:            uv run python tile_cache.py stats"
-Write-Host "  ▸ 参数配置:            编辑 config.py（下载范围/数据源）"
-Write-Host "  ▸ 首次使用前记得在 config.py 中配置目标 WMTS 服务参数"
+Write-Host "  ▸ API 文档:            服务启动后访问 http://127.0.0.1:8760/docs"
+Write-Host "  ▸ 参数配置:            编辑 config.py（默认值）；运行期配置在 config.json"
 Write-Host ""

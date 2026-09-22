@@ -5,15 +5,17 @@
 ![uv](https://img.shields.io/badge/uv-%E5%8C%85%E7%AE%A1%E7%90%86%E5%99%A8-8E7DFF?logo=astral&logoColor=white)
 ![GitHub Stars](https://img.shields.io/github/stars/duwenba/wmts-tile-tool?style=social)
 
-高性能的 **WMTS 瓦片批量下载与拼接** 工具：HTTP/2 异步高并发下载、断点续传与失败重试；默认 **Rust 拼接引擎**（内存恒定、实测 <22 MB）快速合并超大图（数十亿像素）并输出分块 BigTIFF（.tif）；内置 wxPython 图形界面。
+高性能的 **WMTS 瓦片批量下载与拼接** 工具：HTTP/2 异步高并发下载、断点续传与失败重试；默认 **Rust 拼接引擎**（内存恒定、实测 <22 MB）快速合并超大图（数十亿像素）并输出分块 BigTIFF（.tif）；提供 **Web 前端**（内置 HTTP API + SSE 实时进度）与 wxPython 图形界面（薄客户端）。
 
 ## ✨ 功能特性
 
+- 🌐 **Web 前端 + HTTP API**：浏览器完成全流程；`/api/*` REST + SSE 可编程接口（Swagger 文档自动生成），下载/拼接/地理标签与 UI 彻底解耦
+- 🗺️ **地图区域选择下载**：在线拉取图层元数据（无需 info.json），地图框选或经纬度输入 → 自动换算瓦片范围
 - ⚡ **异步高并发下载**：HTTP/2、有界队列 + 固定 worker 池、流式写盘，内存恒定在 O(并发数)
-- 🔁 **断点续传与失败重试**：智能指数退避（尊重服务端限流），`Ctrl+C` 安全中断
+- 🔁 **断点续传与失败重试**：智能指数退避（尊重服务端限流），`Ctrl+C` 安全中断；鉴权失效（Cookie 过期）自动中止并明确提示
 - 🧩 **Rust 拼接引擎**：分块 BigTIFF / 流式 PNG、内存恒定、8 核并行压缩，实测 32.9 亿像素 8 秒完成、峰值内存 21.6 MB
-- 🖥️ **wxPython 图形界面**：任务流水线可视化、单个瓦片预览、范围总览网格、实时进度
-- 🗃️ **瓦片缓存管理**：分级目录结构、统计 / 清理 / 迁移 / 校验（CLI 与 GUI）
+- 🖥️ **wxPython 图形界面**：任务流水线可视化、单个瓦片预览、范围总览网格、实时进度（薄客户端，业务与 Web 共用同一核心）
+- 🗃️ **瓦片缓存管理**：分级目录结构、统计 / 清理 / 迁移 / 校验（CLI、Web 与 GUI）
 
 ## 🚀 快速开始
 
@@ -27,7 +29,10 @@ cd wmts-tile-tool
 # 2. 一键构建（安装 Python 依赖 + 编译 Rust 引擎 + 自检）
 ./build.sh
 
-# 3. 启动图形界面（推荐）
+# 3. 启动 Web 前端（推荐，浏览器自动打开 http://127.0.0.1:8760）
+uv run python -m wmts.server
+
+# 或启动图形界面
 uv run python gui_main.py
 ```
 
@@ -65,22 +70,31 @@ uv run python gui_main.py
 
 | 文件 | 说明 |
 |------|------|
-| `config.py` | **统一配置文件**（下载与拼接参数都在此修改） |
+| `config.py` | **默认配置文件**（下载与拼接参数的默认值在此修改） |
+| `config.json` | 运行期配置（Web/GUI「保存配置」写入，gitignored，优先级高于 config.py） |
 | `build.sh` | **一键构建脚本（Linux/macOS）**（装依赖 + 编译 Rust 引擎 + 自检） |
 | `build.ps1` | **一键构建脚本（Windows，PowerShell）** |
-| `download_tiles_async.py` | 异步下载脚本（HTTP/2，推荐） |
-| `download_tiles.py` | 同步下载脚本 |
-| `merge_rs_cli.py` | **Rust 合并引擎便捷入口（拼接入口）** |
+| `wmts/` | **核心包**（业务逻辑单一来源，UI 无关） |
+| `wmts/core/` | 配置 / 下载 / 合并 / 地理标签 / 缓存 / 预览 / 图层元数据 / 事件 |
+| `wmts/tasks.py` | 任务编排（TaskManager：流水线、取消、事件广播） |
+| `wmts/api.py` | **HTTP API**（FastAPI：REST + SSE + 静态托管） |
+| `wmts/server.py` | Web 服务启动入口 |
+| `wmts/web/` | Web 前端（vanilla JS 单页，无构建步骤） |
+| `download_tiles_async.py` | 异步下载 CLI 薄壳（HTTP/2，默认 64 并发） |
+| `download_tiles.py` | 下载 CLI 薄壳（兼容旧 import 路径；实现在 `wmts/core/downloader.py`） |
+| `merge_rs_cli.py` | Rust 合并引擎便捷薄壳（拼接入口） |
 | `merge_rs/` | Rust 合并引擎源码（cargo 项目） |
-| `gui_main.py` | **wxPython 图形界面**（推荐使用） |
-| `tile_path.py` | 缓存路径统一管理（新旧目录结构兼容） |
-| `tile_cache.py` | 缓存管理 CLI（统计 / 清理 / 迁移 / 校验） |
-| `geo_attach.py` | 为合并后的 TIFF 附加地理信息（GeoTIFF 标签，一次性修补） |
+| `gui_main.py` | **wxPython 图形界面**（薄客户端） |
+| `tile_path.py` | 缓存路径薄壳（实现在 `wmts/core/paths.py`） |
+| `tile_cache.py` | 缓存管理 CLI（薄壳；实现在 `wmts/core/cache.py`） |
+| `geo_attach.py` | 附加地理信息 CLI（薄壳；实现在 `wmts/core/georef.py`） |
+| `tests/` | 核心层单元测试（pytest） |
 | `tiles/` | 瓦片缓存目录（自动创建，分级结构） |
 
 ## ⚙️ 配置参数
 
-所有下载与拼接参数集中在 `config.py`，各脚本自动读取同一份配置：
+**默认值**在 `config.py`（与旧版一致），**运行期配置**保存在 `config.json`（Web/GUI 的
+「保存配置」写入；存在时优先于 `config.py`）：
 
 ```python
 # 下载范围配置
@@ -96,6 +110,9 @@ OUTPUT_FILE = "merged_map.tif"   # 输出文件名（默认 Rust 引擎分块 Bi
 ```
 
 > 如需更换数据源，请更新 `BASE_URL`、`LAYER` 与 `HEADERS`（部分服务需要 Cookie 鉴权）。
+> 图层元数据地址默认从 `BASE_URL` 自动推导（`/api/igs/rest/mrcs/tiles/{layer}?f=json&v=2.0`），
+> 特殊服务可显式配置 `META_URL` 模板。**不再依赖临时的 `info.json`**——瓦片格网定义
+> 一律从数据源在线拉取（首次获取后缓存到 `layer_meta/{layer}.json`，TTL 由 `META_TTL` 控制）。
 
 ## 🗺️ 数据源：湖北省地质大数据平台（geocloud.hubgs.com）
 
@@ -106,14 +123,15 @@ OUTPUT_FILE = "merged_map.tif"   # 输出文件名（默认 Rust 引擎分块 Bi
 ### 瓦片接口
 
 - **元数据**（瓦片格网定义）：`/api/igs/rest/mrcs/tiles/{layer}?f=json&v=2.0`，
-  返回 `tileInfo`（切片原点、分辨率、级别、坐标系等），如仓库内 `info.json`。
+  返回 `tileInfo`（切片原点、分辨率、级别、坐标系等）与 `fullExtent`（图层有效范围），
+  由工具在线拉取（见 `wmts/core/layer_meta.py`）。
 - **取图**：OGC 标准 WMTS `GetTile`，`tilematrixset=EPSG:4326`：
 
 ```
 https://geocloud.hubgs.com/api/igs/rest/ogc/WMTSServer?layer={layer}&style=default&tilematrixset=EPSG:4326&Service=WMTS&Request=GetTile&Version=1.0.0&Format=image/png&TileMatrix={z}&TileCol={col}&TileRow={row}
 ```
 
-### 瓦片格网规则（来自 `info.json`）
+### 瓦片格网规则（在线图层元数据）
 
 | 项 | 值 |
 |---|---|
@@ -127,7 +145,7 @@ https://geocloud.hubgs.com/api/igs/rest/ogc/WMTSServer?layer={layer}&style=defau
 
 | 图层编号 | 覆盖范围 | 备注 |
 |---|---|---|
-| `WMTS020101010007021` | 109.49–111.02°E, 31.99–33.01°N（**十堰一带**，含丹江口水库西缘） | 元数据见 `info.json`，`test.html` 可做坐标→瓦片换算 |
+| `WMTS020101010007021` | 109.49–111.02°E, 31.99–33.01°N（**十堰一带**，含丹江口水库西缘） | 旧版临时 `info.json` 记录的即为此图层的元数据 |
 | `WMTS020101010007006` | 112.5–114.0°E, 31.0–32.0°N（**随州—孝感一带**） | `config.py` 当前配置，matrix 16 共 274×183 瓦片 |
 
 ### 内容判定（地质专题图）
@@ -207,9 +225,9 @@ merge_rs/target/release/merge_rs --tiles-dir tiles \
 ## 🗺️ 附加地理信息（GeoTIFF）
 
 Rust 引擎输出的 TIFF 默认不含地理参考。合并完成后运行 `geo_attach.py`：
-它读取 `config.py` 的下载范围与 `info.json` 的瓦片格网定义，自动计算左上角地理坐标与
-像素分辨率，把 GeoTIFF 标签（ModelPixelScale / ModelTiepoint / GeoKeyDirectory）写入
-TIFF，使 QGIS / GDAL / ArcGIS 能按真实经纬度配准显示：
+它读取配置的下载范围与**在线图层元数据**（自动从数据源拉取瓦片格网定义，不再依赖
+info.json），自动计算左上角地理坐标与像素分辨率，把 GeoTIFF 标签（ModelPixelScale /
+ModelTiepoint / GeoKeyDirectory）写入 TIFF，使 QGIS / GDAL / ArcGIS 能按真实经纬度配准显示：
 
 ```bash
 uv run python geo_attach.py            # 修补 merged_map.tif（默认 config.py 的 OUTPUT_FILE）
@@ -223,22 +241,63 @@ uv run python geo_attach.py --file x.tif --epsg 4610   # 自定义文件 / 坐�
 - 重新拼接生成新 TIFF 后需再次运行本脚本（文件尺寸与 config.py 不一致时会拒绝并提示 `--force`）。
 
 
-## 🖥️ 图形界面（wxPython）
+## 🌐 Web 前端与 HTTP API
+
+```bash
+uv run python -m wmts.server                 # 默认 127.0.0.1:8760，自动打开浏览器
+uv run python -m wmts.server --port 9000     # 自定义端口
+uv run python -m wmts.server --host 0.0.0.0 --no-browser   # 局域网访问（注意 Cookie 安全）
+```
+
+Web 前端（`wmts/web/`，vanilla JS 单页、无构建步骤）覆盖完整流程：
+
+- **流水线**：`配置 → 下载 → 拼接 → 地理标签 → 完成` 五步状态 + 总进度条，一键执行全部
+- **状态网格**：画布渲染全部瓦片状态（绿=已下载/红=损坏/灰=待处理），滚轮缩放、拖拽平移、点击跳转预览
+- **区域选择**：在线图层元数据 + 概览地图框选（或经纬度输入）→ 自动换算瓦片范围并应用到配置
+- **预览 / 缓存 / 输出 / 日志**：单瓦片本地与联网预览并可保存；缓存统计清理；产物列表与断点续传下载；SSE 实时日志
+
+### API 一览（启动后访问 `/docs` 查看 Swagger）
+
+```
+配置    GET/PUT /api/config              POST /api/config/reset
+图层    GET  /api/layer/meta?refresh=1   （在线元数据 + 图层覆盖范围）
+网格    GET  /api/grid                   POST /api/grid/from-bbox（bbox→瓦片范围）
+状态    GET  /api/tiles/status           （范围内状态位图，2bit/片）
+预览    GET  /api/tiles/{z}/{col}/{row}?source=auto|local|remote
+        POST /api/tiles/{z}/{col}/{row}/save
+续传    GET  /api/download/progress      （进度日志 + 失败列表）
+任务    POST /api/tasks                  {type: download|merge|geo|pipeline|retry_failed, params}
+        GET  /api/tasks  /api/tasks/{id}      POST /api/tasks/{id}/cancel
+        GET  /api/tasks/{id}/events      → SSE 进度流
+缓存    GET  /api/cache/stats            POST /api/cache/{prune|migrate|verify|clear}
+输出    GET  /api/outputs                GET /api/outputs/{name}（支持 Range 断点续传）
+日志    GET  /api/logs                   GET /api/logs/stream (SSE)
+```
+
+约定：
+
+- 同一时刻只允许一个任务运行，占用时 `POST /api/tasks` 返回 `409`；
+- 进度为单向 SSE，事件带自增 `seq`，先回放缓冲再接实时流（不丢不重）；
+- 上游 Cookie 只保存在服务端（`config.json`），`GET /api/config` 返回打码值；
+- 任务事件统一为 `ProgressEvent` 结构，下载 / 拼接 / 地理标签共用同一 schema。
+
+## 🖥️ 图形界面（wxPython 薄客户端）
 
 ```bash
 uv run python gui_main.py
 ```
 
-界面提供以下能力：
+界面提供以下能力（业务逻辑与 Web 共用 `wmts` 包，GUI 只做渲染）：
 
-- **任务流程可视化**：顶部流水线展示 `配置参数 → 下载瓦片 → 拼接大图 → 任务完成` 四步状态（待命/进行中/完成/失败）与整体进度条。
+- **任务流程可视化**：流水线展示 `配置参数 → 下载瓦片 → 拼接大图 → 地理标签 → 任务完成`
+  五步状态（待命/进行中/完成/失败）与整体进度条，支持一键执行全部（下载→拼接→地理标签）。
 - **单个瓦片预览（自动加载）**：右侧面板输入级别/列/行（或点击总览网格格子）自动加载预览——本地已有则直接显示，缺失时自动从网络获取（仅预览、不落盘），可手动「保存瓦片」。
 - **范围总览网格**：下载页以颜色网格展示每个瓦片状态（绿=已下载、红=失败、灰=待处理），点击格子跳转预览。
 - **一键执行全部**：自动依次完成 下载 → 拼接，也可单独执行下载或拼接。
 - **实时进度**：下载（成功/失败/跳过/速度/剩余时间）与拼接进度、统计信息、日志面板。
 - **缓存管理**：工具栏「缓存管理」按钮，查看统计、按级别/时间/容量清理、迁移旧结构、清空缓存。
 
-> 配置保存在 `gui_config.json`（启动时自动加载），也可在界面上恢复默认或写回配置。
+> 配置保存在 `config.json`（启动时自动加载，与 Web 前端共用；兼容读取旧 `gui_config.json`）。
 
 ### wxPython 跨平台安装
 
