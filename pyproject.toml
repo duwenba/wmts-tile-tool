@@ -16,7 +16,18 @@ dependencies = [
     "socksio>=1.0.0",
 ]
 
+# wxPython 官方在 PyPI 上没有 Linux wheel，但 Windows/macOS 有官方 wheel。
+# 因此按平台分流：Linux 使用官方 extras 仓库的 Ubuntu 24.04 构建
+# （glibc 2.39+，可兼容 Arch/CachyOS 等发行版），其余平台回退到 PyPI。
+[[tool.uv.index]]
+name = "pypi"
+url = "https://pypi.org/simple"
+
 [tool.uv.sources]
-# wxPython 官方在 PyPI 上没有 Linux wheel，此处固定使用官方 extras 仓库的
-# Ubuntu 24.04 构建（glibc 2.39+，可兼容 Arch/CachyOS 等发行版）
-wxpython = { url = "https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04/wxpython-4.2.5-cp314-cp314-linux_x86_64.whl" }
+wxpython = [
+  { url = "https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04/wxpython-4.2.5-cp311-cp311-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_full_version == '3.11.*'" },
+  { url = "https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04/wxpython-4.2.5-cp312-cp312-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_full_version == '3.12.*'" },
+  { url = "https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04/wxpython-4.2.5-cp313-cp313-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_full_version == '3.13.*'" },
+  { url = "https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04/wxpython-4.2.5-cp314-cp314-linux_x86_64.whl", marker = "sys_platform == 'linux' and python_full_version >= '3.14'" },
+  { index = "pypi", marker = "sys_platform != 'linux'" },
+]
