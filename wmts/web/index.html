@@ -3,202 +3,283 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>WMTS 瓦片工具</title>
+<title>WMTS 瓦片工作台</title>
 <link rel="stylesheet" href="style.css">
 </head>
 <body>
+<div id="app">
 
-<!-- 顶部：任务流水线 -->
-<header id="topbar">
-  <div id="brand">🗺️ WMTS 瓦片工具</div>
-  <ol id="pipeline">
-    <li data-step="0">配置</li>
-    <li data-step="1">下载</li>
-    <li data-step="2">拼接</li>
-    <li data-step="3">地理标签</li>
-    <li data-step="4">完成</li>
-  </ol>
-  <div id="overall">
-    <div id="overall-bar"></div>
+  <!-- ================= 顶栏 ================= -->
+  <header id="topbar">
+    <div id="brand"><span class="logo">🗺️</span> WMTS 瓦片工作台</div>
+    <ol id="pipeline">
+      <li data-step="0">配置</li>
+      <li data-step="1">下载</li>
+      <li data-step="2">拼接</li>
+      <li data-step="3">地理标签</li>
+      <li data-step="4">完成</li>
+    </ol>
+    <!-- 读数放在进度条外侧：白字压在浅色轨道上时对比度不足、进度低时几乎看不见 -->
+    <div id="overall" title="总进度">
+      <div id="overall-bar"></div>
+    </div>
     <span id="overall-text">待命</span>
-  </div>
-</header>
+    <button id="btn-stop" class="btn danger" disabled>■ 停止</button>
+  </header>
 
-<!-- 操作条 -->
-<div id="actionbar">
-  <button id="btn-pipeline" class="primary">▶ 一键执行全部</button>
-  <button id="btn-download">开始下载</button>
-  <button id="btn-merge">开始拼接</button>
-  <button id="btn-geo">地理标签</button>
-  <button id="btn-stop" disabled>■ 停止</button>
-  <span id="range-hint"></span>
-  <span class="spacer"></span>
-  <span id="task-state"></span>
+  <!-- 鉴权失效横幅 -->
+  <div id="auth-banner" hidden>
+    <span>⚠️ <b>上游鉴权失效</b>（Cookie 可能已过期），下载已中止。</span>
+    <button id="auth-fix" class="btn">去更新 Cookie</button>
+    <button id="auth-close" class="btn ghost">关闭</button>
+  </div>
+
+  <!-- ================= 主体 ================= -->
+  <div id="body">
+
+    <!-- 地图工作台 -->
+    <div id="map-wrap">
+      <canvas id="map"></canvas>
+
+      <!-- 左上工具浮层 -->
+      <div id="tools" class="overlay">
+        <div class="tool-row">
+          <button id="tb-zoom-out" class="icon" title="缩小（-）">−</button>
+          <select id="tb-level" title="缩放级别"></select>
+          <button id="tb-zoom-in" class="icon" title="放大（+）">＋</button>
+        </div>
+        <div class="tool-row">
+          <button id="tb-pan" class="icon active" title="平移（V）">✋</button>
+          <button id="tb-select" class="icon" title="框选区域（S）">▭</button>
+          <button id="tb-fit" class="btn" title="显示整个图层">全图</button>
+          <button id="tb-refresh" class="icon" title="刷新瓦片与状态">⟳</button>
+        </div>
+        <div class="tool-row">
+          <label class="toggle"><input id="tb-grid" type="checkbox" checked> 网格</label>
+          <label class="toggle"><input id="tb-status" type="checkbox" checked> 状态</label>
+        </div>
+        <div class="tool-row">
+          <input id="goto-lon" class="mini" type="number" step="any" placeholder="经度" title="经度">
+          <input id="goto-lat" class="mini" type="number" step="any" placeholder="纬度" title="纬度">
+          <button id="goto-btn" class="icon" title="定位到经纬度">◎</button>
+        </div>
+      </div>
+
+      <!-- 左下读数 -->
+      <div id="readout" class="overlay">
+        <div><span class="k">经度</span><span id="ro-lon" class="v mono">—</span></div>
+        <div><span class="k">纬度</span><span id="ro-lat" class="v mono">—</span></div>
+        <div><span class="k">Tile</span><span id="ro-tile" class="v mono">—</span></div>
+        <div><span class="k">分辨率</span><span id="ro-res" class="v mono">—</span></div>
+      </div>
+
+      <!-- 底部提示 -->
+      <div id="map-hint" class="overlay">拖动平移 · 滚轮缩放 · 双击放大 · 按 S 框选</div>
+
+      <!-- 选区操作条：经纬度范围 + 下载级别 → 瓦片数 -->
+      <div id="selection-bar" hidden>
+        <label class="sel-field">下载级别<select id="sel-level"></select></label>
+        <span id="sel-bbox" class="mono">—</span>
+        <span id="sel-text">—</span>
+        <button id="sel-apply" class="btn primary">应用为下载范围</button>
+        <button id="sel-cancel" class="btn ghost">取消</button>
+      </div>
+
+      <!-- 瓦片气泡 -->
+      <div id="tile-pop" hidden>
+        <div class="pop-head">
+          <b id="pop-title">—</b>
+          <button id="pop-close" class="icon" title="关闭">✕</button>
+        </div>
+        <div class="pop-img-wrap"><img id="pop-img" alt="瓦片预览"></div>
+        <div class="pop-meta" id="pop-meta">—</div>
+        <div class="pop-actions">
+          <button id="pop-save" class="btn" disabled>加入缓存</button>
+          <button id="pop-zoom" class="btn ghost">放大到此瓦片</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- 右侧流程面板 -->
+    <aside id="panel">
+      <button id="panel-toggle" class="btn icon" title="收起 / 展开">›</button>
+      <div id="panel-inner">
+
+        <section class="card" data-acc="source">
+          <h3><span class="num">1</span> 数据源与范围</h3>
+          <div class="acc-body">
+            <div class="field"><label>服务地址</label><input id="c-base_url" type="text"></div>
+            <div class="row">
+              <div class="field"><label>图层 Layer</label><input id="c-layer" type="text"></div>
+              <div class="field"><label>样式</label><input id="c-style" type="text"></div>
+            </div>
+            <div class="row">
+              <div class="field"><label>瓦片矩阵集</label><input id="c-tilematrixset" type="text"></div>
+              <div class="field"><label>输出 EPSG</label><input id="c-epsg" type="number"></div>
+            </div>
+            <div class="field">
+              <label>Cookie（留空保持不变；过期后从浏览器重新拷贝）</label>
+              <textarea id="c-cookie" rows="2" placeholder="不修改请留空"></textarea>
+            </div>
+
+            <details class="sub">
+              <summary>下载范围（可手填，或在地图上框选 / 用当前视图）</summary>
+              <div class="row">
+                <div class="field"><label>级别</label><input id="c-tile_matrix" type="number" min="0" max="30"></div>
+                <div class="field"><label>列起</label><input id="c-col_start" type="number"></div>
+                <div class="field"><label>列止</label><input id="c-col_end" type="number"></div>
+              </div>
+              <div class="row">
+                <div class="field"><label>行起</label><input id="c-row_start" type="number"></div>
+                <div class="field"><label>行止</label><input id="c-row_end" type="number"></div>
+              </div>
+              <div class="btnrow">
+                <button id="cfg-apply-layer" class="btn ghost">填入整个图层</button>
+                <button id="cfg-from-view" class="btn ghost">用当前视图</button>
+              </div>
+            </details>
+
+            <details class="sub">
+              <summary>高级（输出与并发）</summary>
+              <div class="row">
+                <div class="field"><label>保存目录</label><input id="c-output_dir" type="text"></div>
+                <div class="field"><label>输出文件</label><input id="c-output_file" type="text"></div>
+              </div>
+              <div class="row">
+                <div class="field"><label>并发数</label><input id="c-max_workers" type="number" min="1" max="128"></div>
+                <div class="field"><label>超时（秒）</label><input id="c-timeout" type="number" min="1" max="120"></div>
+              </div>
+            </details>
+
+            <div id="range-summary" class="summary">—</div>
+            <div class="btnrow">
+              <button id="cfg-save" class="btn primary">保存配置</button>
+              <button id="cfg-reset" class="btn ghost">恢复默认</button>
+              <span id="cfg-hint" class="hint"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="card" data-acc="task">
+          <h3><span class="num">2</span> 任务与进度</h3>
+          <div class="acc-body">
+            <div class="btnrow">
+              <button id="btn-pipeline" class="btn primary wide">▶ 一键执行全部（下载 → 拼接 → 地理标签）</button>
+            </div>
+            <div class="btnrow">
+              <button id="btn-download" class="btn">仅下载</button>
+              <button id="btn-merge" class="btn">仅拼接</button>
+              <button id="btn-geo" class="btn">仅地理标签</button>
+              <button id="dl-focus" class="btn ghost" title="把地图缩放到当前下载范围并显示状态">查看下载范围</button>
+            </div>
+            <details class="sub">
+              <summary>拼接参数</summary>
+              <div class="radio-row">
+                <label class="radio"><input type="radio" name="mg-fmt" value="tif" checked> BigTIFF 分块（推荐）</label>
+                <label class="radio"><input type="radio" name="mg-fmt" value="png"> 单张 PNG</label>
+              </div>
+              <div class="row">
+                <div class="field"><label>并行线程（0=自动）</label><input id="mg-threads" type="number" min="0" max="64" value="0"></div>
+                <div class="field"><label>压缩级别（0-12）</label><input id="mg-level" type="number" min="0" max="12" value="6"></div>
+              </div>
+              <label class="check"><input id="c-auto_geo" type="checkbox"> 拼接后自动附加地理标签</label>
+            </details>
+
+            <div class="progress-block">
+              <div class="progress-head"><span>下载</span><span id="dl-percent" class="mono">0%</span></div>
+              <div class="bar"><div id="dl-bar"></div></div>
+              <div id="dl-stats" class="stats">尚未开始</div>
+              <div id="dl-resume" class="resumable"></div>
+            </div>
+            <div class="progress-block">
+              <div class="progress-head"><span>拼接</span><span id="mg-percent" class="mono">0%</span></div>
+              <div class="bar"><div id="mg-bar"></div></div>
+              <div id="mg-stats" class="stats">尚未开始</div>
+            </div>
+            <div id="task-state" class="hint"></div>
+          </div>
+        </section>
+
+        <section class="card" data-acc="result">
+          <h3><span class="num">3</span> 结果与导出</h3>
+          <div class="acc-body">
+            <div class="btnrow">
+              <button id="out-refresh" class="btn ghost">刷新</button>
+              <span class="hint">GeoTIFF 支持断点续传下载</span>
+            </div>
+            <div id="out-list" class="out-list"></div>
+          </div>
+        </section>
+
+      </div>
+    </aside>
+  </div>
+
+  <!-- ================= 底部状态条 ================= -->
+  <footer id="statusbar">
+    <span id="sb-layer" class="chip">图层 —</span>
+    <span id="sb-cache" class="chip">缓存 —</span>
+    <span id="sb-task" class="chip">待命</span>
+    <span class="spacer"></span>
+    <button id="drawer-cache" class="link">缓存管理</button>
+    <button id="drawer-logs" class="link">日志</button>
+  </footer>
 </div>
 
-<!-- 标签页 -->
-<nav id="tabs">
-  <button data-tab="config" class="active">配置</button>
-  <button data-tab="download">下载</button>
-  <button data-tab="region">区域选择</button>
-  <button data-tab="merge">拼接</button>
-  <button data-tab="cache">缓存</button>
-  <button data-tab="preview">预览</button>
-  <button data-tab="outputs">输出</button>
-  <button data-tab="logs">日志</button>
-</nav>
+<!-- ================= 抽屉 ================= -->
+<div id="drawer" hidden>
+  <div id="drawer-mask"></div>
+  <div id="drawer-panel">
+    <header>
+      <h3 id="drawer-title">抽屉</h3>
+      <button id="drawer-close" class="icon" title="关闭">✕</button>
+    </header>
+    <div id="drawer-body">
 
-<main>
-  <!-- 配置 -->
-  <section id="tab-config" class="tab active">
-    <div class="grid2">
-      <label>服务地址<input id="c-base_url" type="text"></label>
-      <label>图层 Layer<input id="c-layer" type="text"></label>
-      <label>样式<input id="c-style" type="text"></label>
-      <label>瓦片矩阵集<input id="c-tilematrixset" type="text"></label>
-      <label>缩放级别<input id="c-tile_matrix" type="number" min="0" max="30"></label>
-      <label>输出 EPSG<input id="c-epsg" type="number"></label>
-      <label>列起始<input id="c-col_start" type="number"></label>
-      <label>列结束<input id="c-col_end" type="number"></label>
-      <label>行起始<input id="c-row_start" type="number"></label>
-      <label>行结束<input id="c-row_end" type="number"></label>
-      <label>保存目录<input id="c-output_dir" type="text"></label>
-      <label>输出文件<input id="c-output_file" type="text"></label>
-      <label>并发数<input id="c-max_workers" type="number" min="1" max="128"></label>
-      <label>超时(秒)<input id="c-timeout" type="number" min="1" max="120"></label>
-      <label class="wide">Cookie（留空保持不变；过期后从浏览器重新拷贝）
-        <textarea id="c-cookie" rows="2" placeholder="不修改请留空"></textarea></label>
-      <label class="check"><input id="c-auto_geo" type="checkbox"> 拼接后自动附加地理标签</label>
-    </div>
-    <div class="btnrow">
-      <button id="cfg-save" class="primary">保存配置</button>
-      <button id="cfg-reset">恢复默认</button>
-      <button id="cfg-apply-layer">填入整个图层范围</button>
-      <span id="cfg-hint" class="hint"></span>
-    </div>
-  </section>
-
-  <!-- 下载 -->
-  <section id="tab-download" class="tab">
-    <div class="progress-row">
-      <div class="bar"><div id="dl-bar"></div></div>
-      <span id="dl-percent">0%</span>
-    </div>
-    <div id="dl-stats" class="stats">尚未开始</div>
-    <div class="btnrow">
-      <button id="dl-refresh">刷新状态</button>
-      <button id="dl-layer-range">切换到图层范围</button>
-      <span id="dl-hint" class="hint"></span>
-    </div>
-    <div class="resumable" id="dl-resume"></div>
-    <canvas id="status-grid"></canvas>
-    <div class="legend">绿=已下载 红=损坏 灰=待处理 · 滚轮缩放 / 拖拽平移 / 点击瓦片预览</div>
-  </section>
-
-  <!-- 区域选择 -->
-  <section id="tab-region" class="tab">
-    <div class="region-controls">
-      <label>目标级别
-        <select id="rg-matrix"></select></label>
-      <label>概览级别
-        <select id="rg-overview"></select></label>
-      <button id="rg-fit">显示整个图层</button>
-      <span class="hint">左键拖拽框选 · 右键拖拽平移 · 滚轮缩放</span>
-    </div>
-    <canvas id="region-map"></canvas>
-    <div class="region-bbox">
-      <label>经度 min<input id="rg-lonmin" type="number" step="0.0001"></label>
-      <label>纬度 min<input id="rg-latmin" type="number" step="0.0001"></label>
-      <label>经度 max<input id="rg-lonmax" type="number" step="0.0001"></label>
-      <label>纬度 max<input id="rg-latmax" type="number" step="0.0001"></label>
-      <button id="rg-apply-bbox">按经纬度换算</button>
-    </div>
-    <div class="region-result">
-      <span id="rg-result" class="hint">在地图上框选区域，或输入经纬度范围</span>
-      <button id="rg-apply-config" class="primary" disabled>应用到下载范围</button>
-    </div>
-  </section>
-
-  <!-- 拼接 -->
-  <section id="tab-merge" class="tab">
-    <div class="radio-row">
-      <label class="check"><input type="radio" name="mg-fmt" value="tif" checked> BigTIFF 分块（.tif，推荐，无损，内存恒定）</label>
-      <label class="check"><input type="radio" name="mg-fmt" value="png"> 单张 PNG（中等成图）</label>
-    </div>
-    <div class="grid2">
-      <label>并行线程（0=自动）<input id="mg-threads" type="number" min="0" max="64" value="0"></label>
-      <label>压缩级别 (0-12)<input id="mg-level" type="number" min="0" max="12" value="6"></label>
-    </div>
-    <div class="progress-row">
-      <div class="bar"><div id="mg-bar"></div></div>
-      <span id="mg-percent">0%</span>
-    </div>
-    <div id="mg-stats" class="stats">尚未开始</div>
-  </section>
-
-  <!-- 缓存 -->
-  <section id="tab-cache" class="tab">
-    <div class="btnrow">
-      <button id="ca-refresh" class="primary">刷新统计</button>
-      <button id="ca-migrate">迁移旧结构</button>
-      <button id="ca-verify">校验完整性</button>
-      <button id="ca-clear" class="danger">清空缓存…</button>
-    </div>
-    <table id="ca-table" class="table">
-      <thead><tr><th>图层</th><th>级别</th><th>瓦片数</th><th>大小</th><th>列范围</th><th>行范围</th><th>行目录数</th></tr></thead>
-      <tbody></tbody>
-    </table>
-    <details>
-      <summary>按条件清理（prune，默认只清理当前图层）</summary>
-      <div class="grid2">
-        <label>级别<input id="ca-matrix" type="number"></label>
-        <label>删除 N 天前<input id="ca-older" type="number"></label>
-        <label>列起始<input id="ca-cs" type="number"></label>
-        <label>列结束<input id="ca-ce" type="number"></label>
-        <label>行起始<input id="ca-rs" type="number"></label>
-        <label>行结束<input id="ca-re" type="number"></label>
-        <label>容量上限 MB<input id="ca-maxsize" type="number"></label>
+      <div id="drawer-cache-view" class="drawer-view">
+        <div class="btnrow">
+          <button id="ca-refresh" class="btn primary">刷新统计</button>
+          <button id="ca-migrate" class="btn">迁移旧结构</button>
+          <button id="ca-verify" class="btn">校验完整性</button>
+          <button id="ca-clear" class="btn danger">清空缓存…</button>
+        </div>
+        <div id="ca-hint" class="hint"></div>
+        <table id="ca-table" class="table">
+          <thead><tr><th>图层</th><th>级别</th><th>瓦片数</th><th>大小</th><th>列范围</th><th>行范围</th><th>行目录</th></tr></thead>
+          <tbody></tbody>
+        </table>
+        <details>
+          <summary>按条件清理（prune，默认只清理当前图层）</summary>
+          <div class="row">
+            <div class="field"><label>级别</label><input id="ca-matrix" type="number"></div>
+            <div class="field"><label>删除 N 天前</label><input id="ca-older" type="number"></div>
+            <div class="field"><label>容量上限 MB</label><input id="ca-maxsize" type="number"></div>
+          </div>
+          <div class="row">
+            <div class="field"><label>列起</label><input id="ca-cs" type="number"></div>
+            <div class="field"><label>列止</label><input id="ca-ce" type="number"></div>
+            <div class="field"><label>行起</label><input id="ca-rs" type="number"></div>
+            <div class="field"><label>行止</label><input id="ca-re" type="number"></div>
+          </div>
+          <div class="btnrow">
+            <button id="ca-prune" class="btn danger">执行清理</button>
+            <span class="hint">不可恢复，请谨慎操作</span>
+          </div>
+        </details>
       </div>
-      <div class="btnrow"><button id="ca-prune" class="danger">执行清理</button>
-        <span id="ca-hint" class="hint"></span></div>
-    </details>
-  </section>
 
-  <!-- 预览 -->
-  <section id="tab-preview" class="tab">
-    <div class="region-controls">
-      <label>级别<input id="pv-matrix" type="number" min="0" max="30"></label>
-      <label>列<input id="pv-col" type="number"></label>
-      <label>行<input id="pv-row" type="number"></label>
-      <button id="pv-load" class="primary">加载</button>
-      <button id="pv-local">本地</button>
-      <button id="pv-remote">联网获取</button>
-      <button id="pv-save" disabled>保存到缓存</button>
-      <span id="pv-info" class="hint"></span>
+      <div id="drawer-logs-view" class="drawer-view" hidden>
+        <div class="btnrow">
+          <button id="log-clear" class="btn ghost">清屏</button>
+          <button id="log-save" class="btn ghost">保存日志</button>
+          <label class="check"><input id="log-follow" type="checkbox" checked> 自动滚动</label>
+        </div>
+        <pre id="log-view"></pre>
+      </div>
+
     </div>
-    <div id="pv-wrap"><img id="pv-img" alt="瓦片预览"></div>
-  </section>
-
-  <!-- 输出 -->
-  <section id="tab-outputs" class="tab">
-    <div class="btnrow"><button id="out-refresh" class="primary">刷新</button>
-      <span class="hint">GeoTIFF 可直接下载（支持断点续传）</span></div>
-    <table id="out-table" class="table">
-      <thead><tr><th>文件</th><th>大小</th><th>地理标签</th><th>修改时间</th><th></th></tr></thead>
-      <tbody></tbody>
-    </table>
-  </section>
-
-  <!-- 日志 -->
-  <section id="tab-logs" class="tab">
-    <div class="btnrow">
-      <button id="log-clear">清屏</button>
-      <button id="log-save">保存日志</button>
-      <label class="check"><input id="log-follow" type="checkbox" checked> 自动滚动</label>
-    </div>
-    <pre id="log-view"></pre>
-  </section>
-</main>
+  </div>
+</div>
 
 <div id="toast" hidden></div>
 <script src="grid.js"></script>
