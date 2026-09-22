@@ -1,0 +1,789 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>WMTS 单文件地图浏览器</title>
+<style>
+*{box-sizing:border-box}
+html,body{width:100%;height:100%;margin:0;overflow:hidden;font-family:system-ui,-apple-system,"Segoe UI",sans-serif}
+body{background:#202124;color:#222}
+#app{width:100%;height:100%;position:relative}
+#map{position:absolute;inset:0;background:#ddd;cursor:grab}
+#map.dragging{cursor:grabbing}
+canvas{display:block;width:100%;height:100%}
+
+#toolbar{
+ position:absolute;top:12px;left:12px;right:12px;z-index:10;
+ display:flex;align-items:center;gap:8px;flex-wrap:wrap;
+ padding:10px;background:rgba(255,255,255,.96);
+ border:1px solid #ccc;border-radius:9px;box-shadow:0 2px 12px #0002
+}
+input,select,button{
+ height:34px;border:1px solid #bbb;border-radius:6px;background:#fff;
+ padding:0 9px;font-size:13px
+}
+input{width:115px}
+select{width:92px}
+button{cursor:pointer;background:#222;color:#fff;border-color:#222}
+button:hover{opacity:.85}
+label{font-size:12px;color:#555}
+.check{display:flex;align-items:center;gap:4px}
+.check input{width:auto;height:auto}
+
+#panel{
+ position:absolute;right:12px;top:76px;width:320px;z-index:10;
+ max-height:calc(100% - 88px);overflow:auto;
+ background:rgba(255,255,255,.96);border:1px solid #ccc;border-radius:9px;
+ box-shadow:0 2px 12px #0002;padding:14px
+}
+h3{font-size:14px;margin:0 0 10px}
+.section{padding-bottom:15px;margin-bottom:15px;border-bottom:1px solid #ddd}
+.info{display:grid;grid-template-columns:90px 1fr;gap:7px;font-size:12px}
+.info>div:nth-child(odd){color:#777}
+.mono{font-family:ui-monospace,SFMono-Regular,Consolas,monospace;word-break:break-all}
+textarea{
+ width:100%;height:120px;resize:vertical;padding:8px;border:1px solid #bbb;
+ border-radius:6px;font:11px ui-monospace,SFMono-Regular,Consolas,monospace
+}
+#status{font-size:11px;color:#666;line-height:1.6}
+#coords{
+ position:absolute;left:12px;bottom:12px;z-index:10;
+ padding:7px 9px;border-radius:6px;background:rgba(255,255,255,.92);
+ font:12px ui-monospace,SFMono-Regular,Consolas,monospace;
+ box-shadow:0 1px 6px #0002
+}
+#zoomHint{
+ position:absolute;left:50%;bottom:12px;transform:translateX(-50%);
+ z-index:10;padding:6px 10px;background:#fffddc;border-radius:5px;
+ font-size:11px;color:#665f00;opacity:.9
+}
+#error{
+ position:absolute;left:50%;top:50%;transform:translate(-50%,-50%);
+ z-index:20;display:none;max-width:650px;padding:16px;
+ background:#fff;border:1px solid #d66;border-radius:8px;
+ box-shadow:0 4px 20px #0003;font-size:13px
+}
+@media(max-width:800px){
+ #panel{width:280px;top:auto;bottom:50px;max-height:45%}
+}
+</style>
+</head>
+
+<body>
+<div id="app">
+  <div id="map"><canvas id="canvas"></canvas></div>
+
+  <div id="toolbar">
+    <label>经度</label>
+    <input id="lon" type="number" step="any" value="110.999913">
+    <label>纬度</label>
+    <input id="lat" type="number" step="any" value="32.000127">
+    <label>Level</label>
+    <select id="level"></select>
+    <button id="goto">定位</button>
+    <button id="open">打开当前瓦片</button>
+    <label class="check">
+      <input id="grid" type="checkbox" checked>瓦片网格
+    </label>
+  </div>
+
+  <aside id="panel">
+    <div class="section">
+      <h3>当前瓦片</h3>
+      <div class="info">
+        <div>TileMatrix</div><div id="rLevel" class="mono">—</div>
+        <div>TileCol</div><div id="rCol" class="mono">—</div>
+        <div>TileRow</div><div id="rRow" class="mono">—</div>
+        <div>Resolution</div><div id="rRes" class="mono">—</div>
+        <div>瓦片角度</div><div id="rDeg" class="mono">—</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>当前瓦片范围</h3>
+      <div class="info">
+        <div>West</div><div id="west" class="mono">—</div>
+        <div>East</div><div id="east" class="mono">—</div>
+        <div>South</div><div id="south" class="mono">—</div>
+        <div>North</div><div id="north" class="mono">—</div>
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>WMTS GetTile URL</h3>
+      <textarea id="url" readonly></textarea>
+      <div style="margin-top:8px">
+        <button id="copy">复制链接</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <h3>服务信息</h3>
+      <div id="status">
+        坐标系：西安80地理坐标系（wkid=5）<br>
+        原点：(-180, 90)<br>
+        瓦片：256 × 256<br>
+        Level：0 ～ 18
+      </div>
+    </div>
+  </aside>
+
+  <div id="coords">经度 —　纬度 —　|　Tile —</div>
+  <div id="zoomHint">拖动地图 · 滚轮缩放 · 双击放大</div>
+  <div id="error"></div>
+</div>
+
+<script>
+"use strict";
+
+/* =========================================================
+   服务参数
+   ========================================================= */
+
+const WMTS_BASE =
+  "https://geocloud.hubgs.com/api/igs/rest/ogc/WMTSServer";
+
+const LAYER = "WMTS020101010007021";
+const STYLE = "default";
+const MATRIX_SET = "EPSG:4326";
+
+const ORIGIN_X = -180;
+const ORIGIN_Y = 90;
+const TILE_SIZE = 256;
+
+const BASE_RESOLUTION = 1.4062499999782967;
+
+const SERVICE_EXTENT = {
+  xmin: 109.49130461041318,
+  ymin: 31.991001816963106,
+  xmax: 111.01751518598587,
+  ymax: 33.007343175046046
+};
+
+const resolutions = Array.from(
+  {length:19},
+  (_, z) => BASE_RESOLUTION / Math.pow(2,z)
+);
+
+/* =========================================================
+   DOM
+   ========================================================= */
+
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+
+const lonInput = document.getElementById("lon");
+const latInput = document.getElementById("lat");
+const levelSelect = document.getElementById("level");
+
+for(let z=0; z<=18; z++){
+  const option = document.createElement("option");
+  option.value = z;
+  option.textContent = "Level " + z;
+  if(z === 16) option.selected = true;
+  levelSelect.appendChild(option);
+}
+
+/* =========================================================
+   地图状态
+   ========================================================= */
+
+const map = {
+  lon: 110.999913,
+  lat: 32.000127,
+  level: 16,
+  width: 0,
+  height: 0,
+  dragging: false,
+  dragX: 0,
+  dragY: 0,
+  startWorldX: 0,
+  startWorldY: 0
+};
+
+let tileCache = new Map();
+let currentUrl = "";
+
+/* =========================================================
+   坐标 <-> 世界像素
+   ========================================================= */
+
+function worldX(lon, level){
+  return (lon - ORIGIN_X) / resolutions[level];
+}
+
+function worldY(lat, level){
+  return (ORIGIN_Y - lat) / resolutions[level];
+}
+
+function lonFromWorld(x, level){
+  return ORIGIN_X + x * resolutions[level];
+}
+
+function latFromWorld(y, level){
+  return ORIGIN_Y - y * resolutions[level];
+}
+
+/* =========================================================
+   Tile 计算
+   ========================================================= */
+
+function getTile(lon, lat, level){
+  const d = resolutions[level] * TILE_SIZE;
+
+  const col = Math.floor((lon + 180) / d);
+  const row = Math.floor((90 - lat) / d);
+
+  const west = -180 + col * d;
+  const east = west + d;
+  const north = 90 - row * d;
+  const south = north - d;
+
+  return {
+    level,
+    col,
+    row,
+    west,
+    east,
+    south,
+    north,
+    resolution: resolutions[level],
+    degrees: d
+  };
+}
+
+function makeUrl(level, col, row){
+  const p = new URLSearchParams({
+    layer: LAYER,
+    style: STYLE,
+    tilematrixset: MATRIX_SET,
+    Service: "WMTS",
+    Request: "GetTile",
+    Version: "1.0.0",
+    Format: "image/png",
+    TileMatrix: String(level),
+    TileCol: String(col),
+    TileRow: String(row)
+  });
+
+  return WMTS_BASE + "?" + p.toString();
+}
+
+/* =========================================================
+   Tile 加载
+   ========================================================= */
+
+function loadTile(level, col, row){
+  const key = level + "/" + col + "/" + row;
+
+  if(tileCache.has(key)){
+    return tileCache.get(key);
+  }
+
+  const img = new Image();
+
+  const item = {
+    img,
+    loaded: false,
+    failed: false
+  };
+
+  img.onload = () => {
+    item.loaded = true;
+    draw();
+  };
+
+  img.onerror = () => {
+    item.failed = true;
+    draw();
+  };
+
+  img.src = makeUrl(level, col, row);
+
+  tileCache.set(key, item);
+
+  return item;
+}
+
+/* =========================================================
+   Canvas
+   ========================================================= */
+
+function resize(){
+  const dpr = window.devicePixelRatio || 1;
+
+  map.width = canvas.clientWidth;
+  map.height = canvas.clientHeight;
+
+  canvas.width = Math.round(map.width * dpr);
+  canvas.height = Math.round(map.height * dpr);
+
+  ctx.setTransform(dpr,0,0,dpr,0,0);
+
+  draw();
+}
+
+function draw(){
+  const w = map.width;
+  const h = map.height;
+
+  ctx.clearRect(0,0,w,h);
+
+  ctx.fillStyle = "#d9d9d9";
+  ctx.fillRect(0,0,w,h);
+
+  const z = map.level;
+  const res = resolutions[z];
+
+  /*
+   * 当前地图中心对应的世界像素
+   */
+  const centerX = worldX(map.lon,z);
+  const centerY = worldY(map.lat,z);
+
+  /*
+   * Canvas 左上角对应的世界像素
+   */
+  const left = centerX - w / 2;
+  const top = centerY - h / 2;
+
+  /*
+   * 计算需要的瓦片范围
+   */
+  const col0 = Math.floor(left / TILE_SIZE) - 1;
+  const col1 = Math.floor((left + w) / TILE_SIZE) + 1;
+  const row0 = Math.floor(top / TILE_SIZE) - 1;
+  const row1 = Math.floor((top + h) / TILE_SIZE) + 1;
+
+  for(let row=row0; row<=row1; row++){
+    for(let col=col0; col<=col1; col++){
+
+      /*
+       * 服务实际有效范围之外不请求。
+       */
+      const west = ORIGIN_X + col * TILE_SIZE * res;
+      const east = west + TILE_SIZE * res;
+      const north = ORIGIN_Y - row * TILE_SIZE * res;
+      const south = north - TILE_SIZE * res;
+
+      if(
+        east < SERVICE_EXTENT.xmin ||
+        west > SERVICE_EXTENT.xmax ||
+        north < SERVICE_EXTENT.ymin ||
+        south > SERVICE_EXTENT.ymax
+      ){
+        continue;
+      }
+
+      const tile = loadTile(z,col,row);
+
+      const x = col * TILE_SIZE - left;
+      const y = row * TILE_SIZE - top;
+
+      if(tile.loaded){
+        ctx.drawImage(
+          tile.img,
+          Math.round(x),
+          Math.round(y),
+          TILE_SIZE,
+          TILE_SIZE
+        );
+      }else{
+        ctx.fillStyle = "#cfcfcf";
+        ctx.fillRect(
+          Math.round(x),
+          Math.round(y),
+          TILE_SIZE,
+          TILE_SIZE
+        );
+      }
+
+      if(document.getElementById("grid").checked){
+        ctx.strokeStyle = "rgba(0,0,0,.42)";
+        ctx.lineWidth = 1;
+        ctx.strokeRect(
+          Math.round(x)+.5,
+          Math.round(y)+.5,
+          TILE_SIZE,
+          TILE_SIZE
+        );
+
+        ctx.fillStyle = "rgba(255,255,255,.78)";
+        ctx.fillRect(x+3,y+3,100,17);
+
+        ctx.fillStyle = "#222";
+        ctx.font = "11px monospace";
+        ctx.fillText(
+          z + "/" + col + "/" + row,
+          x+6,
+          y+15
+        );
+      }
+    }
+  }
+
+  /*
+   * 中心十字
+   */
+  ctx.strokeStyle = "rgba(220,30,30,.8)";
+  ctx.lineWidth = 1;
+
+  ctx.beginPath();
+  ctx.moveTo(w/2-8,h/2);
+  ctx.lineTo(w/2+8,h/2);
+  ctx.moveTo(w/2,h/2-8);
+  ctx.lineTo(w/2,h/2+8);
+  ctx.stroke();
+}
+
+/* =========================================================
+   面板
+   ========================================================= */
+
+function updatePanel(lon,lat,level){
+  const t = getTile(lon,lat,level);
+
+  document.getElementById("rLevel").textContent = t.level;
+  document.getElementById("rCol").textContent = t.col;
+  document.getElementById("rRow").textContent = t.row;
+
+  document.getElementById("rRes").textContent =
+    t.resolution.toFixed(15) + "°/pixel";
+
+  document.getElementById("rDeg").textContent =
+    t.degrees.toFixed(15) + "°";
+
+  document.getElementById("west").textContent =
+    t.west.toFixed(12);
+
+  document.getElementById("east").textContent =
+    t.east.toFixed(12);
+
+  document.getElementById("south").textContent =
+    t.south.toFixed(12);
+
+  document.getElementById("north").textContent =
+    t.north.toFixed(12);
+
+  currentUrl = makeUrl(t.level,t.col,t.row);
+
+  document.getElementById("url").value = currentUrl;
+
+  document.getElementById("coords").textContent =
+    "经度 " + lon.toFixed(6) +
+    "　纬度 " + lat.toFixed(6) +
+    "　|　Tile " +
+    t.level + "/" + t.col + "/" + t.row;
+}
+
+/* =========================================================
+   鼠标坐标
+   ========================================================= */
+
+function canvasToCoordinate(px,py){
+  const z = map.level;
+
+  const centerX = worldX(map.lon,z);
+  const centerY = worldY(map.lat,z);
+
+  const worldXPos =
+    centerX + (px - map.width/2);
+
+  const worldYPos =
+    centerY + (py - map.height/2);
+
+  return [
+    lonFromWorld(worldXPos,z),
+    latFromWorld(worldYPos,z)
+  ];
+}
+
+canvas.addEventListener("mousemove", e => {
+  const rect = canvas.getBoundingClientRect();
+
+  const x = e.clientX - rect.left;
+  const y = e.clientY - rect.top;
+
+  const c = canvasToCoordinate(x,y);
+
+  updatePanel(c[0],c[1],map.level);
+
+  if(map.dragging){
+    /*
+     * 平移地图：
+     * 1 屏幕像素 = 1 世界像素
+     */
+    const dx = e.clientX - map.dragX;
+    const dy = e.clientY - map.dragY;
+
+    const z = map.level;
+
+    const startLon =
+      lonFromWorld(map.startWorldX - dx,z);
+
+    const startLat =
+      latFromWorld(map.startWorldY - dy,z);
+
+    map.lon = startLon;
+    map.lat = startLat;
+
+    clampCenter();
+    draw();
+  }
+});
+
+canvas.addEventListener("mousedown",e=>{
+  if(e.button !== 0)return;
+
+  const z = map.level;
+
+  map.dragging = true;
+  map.dragX = e.clientX;
+  map.dragY = e.clientY;
+  map.startWorldX = worldX(map.lon,z);
+  map.startWorldY = worldY(map.lat,z);
+
+  document.getElementById("map").classList.add("dragging");
+});
+
+window.addEventListener("mouseup",()=>{
+  map.dragging = false;
+  document.getElementById("map").classList.remove("dragging");
+});
+
+/* =========================================================
+   缩放
+   ========================================================= */
+
+canvas.addEventListener("wheel",e=>{
+  e.preventDefault();
+
+  const oldLevel = map.level;
+
+  let newLevel =
+    oldLevel + (e.deltaY < 0 ? 1 : -1);
+
+  newLevel =
+    Math.max(0,Math.min(18,newLevel));
+
+  if(newLevel === oldLevel)return;
+
+  /*
+   * 保持鼠标下的地理坐标不变。
+   */
+  const rect = canvas.getBoundingClientRect();
+
+  const px = e.clientX - rect.left;
+  const py = e.clientY - rect.top;
+
+  const coordinate =
+    canvasToCoordinate(px,py);
+
+  map.level = newLevel;
+
+  /*
+   * 将鼠标所在经纬度保持在原来的屏幕位置。
+   */
+  const z = newLevel;
+
+  const targetWorldX =
+    worldX(coordinate[0],z);
+
+  const targetWorldY =
+    worldY(coordinate[1],z);
+
+  map.lon =
+    lonFromWorld(
+      targetWorldX - (px-map.width/2),
+      z
+    );
+
+  map.lat =
+    latFromWorld(
+      targetWorldY - (py-map.height/2),
+      z
+    );
+
+  levelSelect.value = String(newLevel);
+
+  clampCenter();
+  updatePanel(coordinate[0],coordinate[1],newLevel);
+  draw();
+});
+
+canvas.addEventListener("dblclick",e=>{
+  const oldLevel = map.level;
+  const newLevel = Math.min(18,oldLevel+1);
+
+  if(newLevel === oldLevel)return;
+
+  const rect = canvas.getBoundingClientRect();
+  const px = e.clientX-rect.left;
+  const py = e.clientY-rect.top;
+
+  const coordinate = canvasToCoordinate(px,py);
+
+  map.level = newLevel;
+
+  const wx = worldX(coordinate[0],newLevel);
+  const wy = worldY(coordinate[1],newLevel);
+
+  map.lon = lonFromWorld(wx-(px-map.width/2),newLevel);
+  map.lat = latFromWorld(wy-(py-map.height/2),newLevel);
+
+  levelSelect.value = String(newLevel);
+
+  clampCenter();
+  draw();
+  updatePanel(coordinate[0],coordinate[1],newLevel);
+});
+
+/* =========================================================
+   防止地图中心跑出服务区域太远
+   ========================================================= */
+
+function clampCenter(){
+  /*
+   * 不强制把中心锁死在数据范围内，只限制到全球范围。
+   */
+  map.lon = Math.max(-180,Math.min(180,map.lon));
+  map.lat = Math.max(-90,Math.min(90,map.lat));
+}
+
+/* =========================================================
+   定位
+   ========================================================= */
+
+document.getElementById("goto").addEventListener("click",()=>{
+  const lon = Number(lonInput.value);
+  const lat = Number(latInput.value);
+  const level = Number(levelSelect.value);
+
+  if(
+    !Number.isFinite(lon) ||
+    !Number.isFinite(lat) ||
+    lon < -180 || lon > 180 ||
+    lat < -90 || lat > 90
+  ){
+    alert("请输入有效的经纬度");
+    return;
+  }
+
+  map.lon = lon;
+  map.lat = lat;
+  map.level = level;
+
+  clampCenter();
+  updatePanel(lon,lat,level);
+  draw();
+});
+
+/* =========================================================
+   Level
+   ========================================================= */
+
+levelSelect.addEventListener("change",()=>{
+  const level = Number(levelSelect.value);
+
+  map.level = level;
+
+  clampCenter();
+
+  const t = getTile(map.lon,map.lat,level);
+
+  updatePanel(map.lon,map.lat,level);
+  draw();
+
+  lonInput.value = map.lon;
+  latInput.value = map.lat;
+});
+
+/* =========================================================
+   打开当前瓦片
+   ========================================================= */
+
+document.getElementById("open").addEventListener("click",()=>{
+  if(currentUrl){
+    window.open(currentUrl,"_blank");
+  }
+});
+
+/* =========================================================
+   复制 URL
+   ========================================================= */
+
+document.getElementById("copy").addEventListener("click",async()=>{
+  if(!currentUrl)return;
+
+  try{
+    await navigator.clipboard.writeText(currentUrl);
+  }catch{
+    const el=document.getElementById("url");
+    el.select();
+    document.execCommand("copy");
+  }
+
+  document.getElementById("status").innerHTML =
+    "链接已复制到剪贴板。<br>" +
+    "当前服务：" + LAYER;
+});
+
+/* =========================================================
+   网格
+   ========================================================= */
+
+document.getElementById("grid").addEventListener("change",draw);
+
+/* =========================================================
+   键盘快捷键
+   ========================================================= */
+
+window.addEventListener("keydown",e=>{
+  if(e.key === "+" || e.key === "="){
+    levelSelect.value =
+      String(Math.min(18,map.level+1));
+    levelSelect.dispatchEvent(new Event("change"));
+  }
+
+  if(e.key === "-" || e.key === "_"){
+    levelSelect.value =
+      String(Math.max(0,map.level-1));
+    levelSelect.dispatchEvent(new Event("change"));
+  }
+});
+
+/* =========================================================
+   初始化
+   ========================================================= */
+
+window.addEventListener("resize",resize);
+
+map.lon = 110.999913;
+map.lat = 32.000127;
+map.level = 16;
+
+resize();
+updatePanel(map.lon,map.lat,map.level);
+draw();
+
+/*
+ * 如果 Tile 请求失败，在页面上给出提示。
+ * 不会阻止其他瓦片继续加载。
+ */
+setTimeout(()=>{
+  const info = document.getElementById("status");
+
+  info.innerHTML =
+    "坐标系：西安80地理坐标系（wkid=5）<br>" +
+    "原点：(-180, 90)<br>" +
+    "瓦片：256 × 256<br>" +
+    "Level：0 ～ 18<br>" +
+    "数据范围：109.4913046 ～ 111.0175152 E，" +
+    "31.9910018 ～ 33.0073432 N<br><br>" +
+    "这是零依赖单文件版本，不使用 OpenLayers/CDN。";
+},100);
+
+</script>
+</body>
+</html>
