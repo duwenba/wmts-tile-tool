@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import queue
 import re
 import time
 from pathlib import Path
@@ -376,11 +377,8 @@ def _format_sse(ev: dict[str, Any]) -> str:
     return f"{sid}data: {json.dumps(ev, ensure_ascii=False)}\n\n"
 
 
-async def _task_event_stream(task_id: str, request: Request):
+async def _task_event_stream(task: Any, task_id: str, request: Request):
     """任务事件流：先回放缓冲，再接实时流，任务结束（done/failed/cancelled）后关闭。"""
-    task = _state.tm.get(task_id)
-    if task is None:
-        raise HTTPException(404, "任务不存在")
     sid, q = _state.tm.events.subscribe()
     last_seq = 0
     try:
@@ -395,7 +393,9 @@ async def _task_event_stream(task_id: str, request: Request):
             try:
                 ev = await asyncio.wait_for(
                     asyncio.to_thread(q.get, True, 1.0), timeout=15.0)
-            except (asyncio.TimeoutError, TimeoutError):
+            except (queue.Empty, asyncio.TimeoutError, TimeoutError):
+                # queue.get 在 1s 内无事件时抛 queue.Empty（而非 TimeoutError），
+                # 需一并捕获，否则 SSE 空闲保活会抛给 ASGI 刷 ERROR
                 yield ": ping\n\n"
                 continue
             if ev.get("task_id") != task_id:
@@ -412,7 +412,12 @@ async def _task_event_stream(task_id: str, request: Request):
 
 @app.get("/api/tasks/{task_id}/events")
 async def task_events(task_id: str, request: Request):
-    return _sse_response(_task_event_stream(task_id, request))
+    # 404 必须在进入 SSE 流式响应之前抛出：生成器内抛异常会在响应头已发出后
+    # 冒泡成 "response already started" 的 ASGI 噪音。
+    task = _state.tm.get(task_id)
+    if task is None:
+        raise HTTPException(404, "任务不存在")
+    return _sse_response(_task_event_stream(task, task_id, request))
 
 
 async def _log_stream(request: Request):
@@ -424,7 +429,8 @@ async def _log_stream(request: Request):
             try:
                 ev = await asyncio.wait_for(
                     asyncio.to_thread(q.get, True, 1.0), timeout=15.0)
-            except (asyncio.TimeoutError, TimeoutError):
+            except (queue.Empty, asyncio.TimeoutError, TimeoutError):
+                # 同上：queue.get 空闲抛 queue.Empty 而非 TimeoutError，需捕获
                 yield ": ping\n\n"
                 continue
             if ev.get("type") != EV_LOG:
